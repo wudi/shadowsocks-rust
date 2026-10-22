@@ -8,7 +8,7 @@ use std::{
 };
 
 use log::{debug, error, info, trace};
-use shadowsocks::{lookup_then, net::TcpListener as ShadowTcpListener, relay::socks5::Address, ServerAddr};
+use shadowsocks::{ServerAddr, lookup_then, net::TcpListener as ShadowTcpListener, relay::socks5::Address};
 use tokio::{
     net::{TcpListener, TcpStream},
     time,
@@ -26,12 +26,13 @@ use crate::{
     net::utils::to_ipv4_mapped,
 };
 
+#[allow(unused_imports)]
 mod sys;
 
 /// Established Client Transparent Proxy
 ///
 /// This method must be called after handshaking with client (for example, socks5 handshaking)
-async fn establish_client_tcp_redir<'a>(
+async fn establish_client_tcp_redir(
     context: Arc<ServiceContext>,
     balancer: PingBalancer,
     mut stream: TcpStream,
@@ -46,7 +47,8 @@ async fn establish_client_tcp_redir<'a>(
     let server = balancer.best_tcp_server();
     let svr_cfg = server.server_config();
 
-    let mut remote = AutoProxyClientStream::connect(context, &server, addr).await?;
+    let mut remote =
+        AutoProxyClientStream::connect_with_opts(context, &server, addr, server.connect_opts_ref()).await?;
 
     establish_tcp_tunnel(svr_cfg, &mut stream, &mut remote, peer_addr, addr).await
 }
@@ -61,10 +63,10 @@ async fn handle_redir_client(
     // Get forward address from socket
     //
     // Try to convert IPv4 mapped IPv6 address for dual-stack mode.
-    if let SocketAddr::V6(ref a) = daddr {
-        if let Some(v4) = to_ipv4_mapped(a.ip()) {
-            daddr = SocketAddr::new(IpAddr::from(v4), a.port());
-        }
+    if let SocketAddr::V6(ref a) = daddr
+        && let Some(v4) = to_ipv4_mapped(a.ip())
+    {
+        daddr = SocketAddr::new(IpAddr::from(v4), a.port());
     }
     let target_addr = Address::from(daddr);
     establish_client_tcp_redir(context, balancer, s, peer_addr, &target_addr).await
@@ -84,7 +86,7 @@ impl RedirTcpServer {
         client_config: &ServerAddr,
         balancer: PingBalancer,
         redir_ty: RedirType,
-    ) -> io::Result<RedirTcpServer> {
+    ) -> io::Result<Self> {
         let listener = match *client_config {
             ServerAddr::SocketAddr(ref saddr) => {
                 TcpListener::bind_redir(redir_ty, *saddr, context.accept_opts()).await?
@@ -97,7 +99,7 @@ impl RedirTcpServer {
             }
         };
 
-        Ok(RedirTcpServer {
+        Ok(Self {
             context,
             listener,
             balancer,

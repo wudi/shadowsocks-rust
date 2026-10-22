@@ -7,12 +7,13 @@ use log::warn;
 
 use crate::{
     config::{ReplayAttackPolicy, ServerType},
-    crypto::{v1::random_iv_or_salt, CipherKind},
+    crypto::CipherKind,
     dns_resolver::DnsResolver,
     security::replay::ReplayProtector,
 };
 
 /// Service context
+#[derive(Debug)]
 pub struct Context {
     // Protector against replay attack
     // The actual replay detection behavior is implemented in ReplayProtector
@@ -32,8 +33,8 @@ pub type SharedContext = Arc<Context>;
 
 impl Context {
     /// Create a new `Context` for `Client` or `Server`
-    pub fn new(config_type: ServerType) -> Context {
-        Context {
+    pub fn new(config_type: ServerType) -> Self {
+        Self {
             replay_protector: ReplayProtector::new(config_type),
             replay_policy: ReplayAttackPolicy::Default,
             dns_resolver: Arc::new(DnsResolver::system_resolver()),
@@ -43,12 +44,13 @@ impl Context {
 
     /// Create a new `Context` shared
     pub fn new_shared(config_type: ServerType) -> SharedContext {
-        SharedContext::new(Context::new(config_type))
+        SharedContext::new(Self::new(config_type))
     }
 
     /// Check if nonce exist or not
     ///
     /// If not, set into the current bloom filter
+    #[cfg(any(feature = "stream-cipher", feature = "aead-cipher", feature = "aead-cipher-2022"))]
     #[inline(always)]
     fn check_nonce_and_set(&self, method: CipherKind, nonce: &[u8]) -> bool {
         match self.replay_policy {
@@ -63,7 +65,10 @@ impl Context {
             return;
         }
 
+        #[cfg(any(feature = "stream-cipher", feature = "aead-cipher", feature = "aead-cipher-2022"))]
         loop {
+            use crate::crypto::utils::random_iv_or_salt;
+
             random_iv_or_salt(nonce);
 
             // Salt already exists, generate a new one.
@@ -72,6 +77,12 @@ impl Context {
             }
 
             break;
+        }
+
+        #[cfg(not(any(feature = "stream-cipher", feature = "aead-cipher", feature = "aead-cipher-2022")))]
+        if !nonce.is_empty() {
+            let _ = unique;
+            panic!("{method} don't know how to generate nonce");
         }
     }
 
@@ -100,7 +111,7 @@ impl Context {
             }
             ReplayAttackPolicy::Reject => {
                 if self.replay_protector.check_nonce_and_set(method, nonce) {
-                    let err = io::Error::new(io::ErrorKind::Other, "detected repeated nonce (iv/salt)");
+                    let err = io::Error::other("detected repeated nonce (iv/salt)");
                     Err(err)
                 } else {
                     Ok(())
@@ -122,8 +133,11 @@ impl Context {
     }
 
     /// Resolves DNS address to `SocketAddr`s
-    #[allow(clippy::needless_lifetimes)]
-    pub async fn dns_resolve<'a>(&self, addr: &'a str, port: u16) -> io::Result<impl Iterator<Item = SocketAddr> + 'a> {
+    pub async fn dns_resolve<'a>(
+        &self,
+        addr: &'a str,
+        port: u16,
+    ) -> io::Result<impl Iterator<Item = SocketAddr> + 'a + use<'a>> {
         self.dns_resolver.resolve(addr, port).await
     }
 
@@ -142,7 +156,7 @@ impl Context {
         self.replay_policy = replay_policy;
     }
 
-    /// Get policy against replay attach
+    /// Get policy against replay attack
     pub fn replay_attack_policy(&self) -> ReplayAttackPolicy {
         self.replay_policy
     }

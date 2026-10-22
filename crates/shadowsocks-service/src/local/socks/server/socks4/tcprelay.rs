@@ -21,12 +21,7 @@ use crate::local::{
 };
 
 use crate::local::socks::socks4::{
-    Address,
-    Command,
-    Error as Socks4Error,
-    HandshakeRequest,
-    HandshakeResponse,
-    ResultCode,
+    Address, Command, Error as Socks4Error, HandshakeRequest, HandshakeResponse, ResultCode,
 };
 
 pub struct Socks4TcpHandler {
@@ -36,8 +31,8 @@ pub struct Socks4TcpHandler {
 }
 
 impl Socks4TcpHandler {
-    pub fn new(context: Arc<ServiceContext>, balancer: PingBalancer, mode: Mode) -> Socks4TcpHandler {
-        Socks4TcpHandler {
+    pub fn new(context: Arc<ServiceContext>, balancer: PingBalancer, mode: Mode) -> Self {
+        Self {
             context,
             balancer,
             mode,
@@ -102,7 +97,13 @@ impl Socks4TcpHandler {
         } else {
             let server = self.balancer.best_tcp_server();
 
-            let r = AutoProxyClientStream::connect(self.context, &server, &target_addr).await;
+            let r = AutoProxyClientStream::connect_with_opts(
+                self.context,
+                &server,
+                &target_addr,
+                server.connect_opts_ref(),
+            )
+            .await;
             server_opt = Some(server);
 
             r

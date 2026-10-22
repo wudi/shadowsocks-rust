@@ -5,7 +5,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use etherparse::PacketBuilder;
 use log::debug;
@@ -32,7 +31,7 @@ impl UdpTun {
         balancer: PingBalancer,
         time_to_live: Option<Duration>,
         capacity: Option<usize>,
-    ) -> (UdpTun, Duration, mpsc::Receiver<SocketAddr>) {
+    ) -> (Self, Duration, mpsc::Receiver<SocketAddr>) {
         let (tun_tx, tun_rx) = mpsc::channel(64);
         let (manager, cleanup_interval, keepalive_rx) = UdpAssociationManager::new(
             context,
@@ -42,7 +41,7 @@ impl UdpTun {
             balancer,
         );
 
-        (UdpTun { tun_rx, manager }, cleanup_interval, keepalive_rx)
+        (Self { tun_rx, manager }, cleanup_interval, keepalive_rx)
     }
 
     pub async fn handle_packet(
@@ -88,12 +87,11 @@ struct UdpTunInboundWriter {
 }
 
 impl UdpTunInboundWriter {
-    fn new(tun_tx: mpsc::Sender<BytesMut>) -> UdpTunInboundWriter {
-        UdpTunInboundWriter { tun_tx }
+    fn new(tun_tx: mpsc::Sender<BytesMut>) -> Self {
+        Self { tun_tx }
     }
 }
 
-#[async_trait]
 impl UdpInboundWrite for UdpTunInboundWriter {
     async fn send_to(&self, peer_addr: SocketAddr, remote_addr: &Address, data: &[u8]) -> io::Result<()> {
         let addr = match *remote_addr {

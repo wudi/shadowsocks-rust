@@ -5,6 +5,7 @@ use std::{
     str,
 };
 
+use byte_string::ByteStr;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     time::{self, Duration},
@@ -13,8 +14,7 @@ use tokio::{
 use shadowsocks_service::{
     config::{Config, ConfigType, LocalConfig, LocalInstanceConfig, ProtocolType, ServerInstanceConfig},
     local::socks::client::socks5::Socks5TcpClient,
-    run_local,
-    run_server,
+    run_local, run_server,
     shadowsocks::{
         config::{Mode, ServerAddr, ServerConfig},
         crypto::CipherKind,
@@ -29,7 +29,7 @@ pub struct Socks5TestServer {
 }
 
 impl Socks5TestServer {
-    pub fn new<S, L>(svr_addr: S, local_addr: L, pwd: &str, method: CipherKind, enable_udp: bool) -> Socks5TestServer
+    pub fn new<S, L>(svr_addr: S, local_addr: L, pwd: &str, method: CipherKind, enable_udp: bool) -> Self
     where
         S: ToSocketAddrs,
         L: ToSocketAddrs,
@@ -37,15 +37,13 @@ impl Socks5TestServer {
         let svr_addr = svr_addr.to_socket_addrs().unwrap().next().unwrap();
         let local_addr = local_addr.to_socket_addrs().unwrap().next().unwrap();
 
-        Socks5TestServer {
+        Self {
             local_addr,
             svr_config: {
                 let mut cfg = Config::new(ConfigType::Server);
-                cfg.server = vec![ServerInstanceConfig::with_server_config(ServerConfig::new(
-                    svr_addr,
-                    pwd.to_owned(),
-                    method,
-                ))];
+                cfg.server = vec![ServerInstanceConfig::with_server_config(
+                    ServerConfig::new(svr_addr, pwd.to_owned(), method).unwrap(),
+                )];
                 cfg.server[0]
                     .config
                     .set_mode(if enable_udp { Mode::TcpAndUdp } else { Mode::TcpOnly });
@@ -58,11 +56,9 @@ impl Socks5TestServer {
                     ProtocolType::Socks,
                 ))];
                 cfg.local[0].config.mode = if enable_udp { Mode::TcpAndUdp } else { Mode::TcpOnly };
-                cfg.server = vec![ServerInstanceConfig::with_server_config(ServerConfig::new(
-                    svr_addr,
-                    pwd.to_owned(),
-                    method,
-                ))];
+                cfg.server = vec![ServerInstanceConfig::with_server_config(
+                    ServerConfig::new(svr_addr, pwd.to_owned(), method).unwrap(),
+                )];
                 cfg
             },
         }
@@ -104,7 +100,7 @@ async fn socks5_relay_stream() {
     .await
     .unwrap();
 
-    let req = b"GET / HTTP/1.0\r\nHost: www.example.com\r\nAccept: */*\r\n\r\n";
+    let req = b"GET / HTTP/1.1\r\nHost: www.example.com\r\nAccept: */*\r\nConnection: close\r\n\r\n";
     c.write_all(req).await.unwrap();
     c.flush().await.unwrap();
 
@@ -113,8 +109,8 @@ async fn socks5_relay_stream() {
     let mut buf = Vec::new();
     r.read_until(b'\n', &mut buf).await.unwrap();
 
-    let http_status = b"HTTP/1.0 200 OK\r\n";
-    assert!(buf.starts_with(http_status));
+    let http_status = b"HTTP/1.1 200 OK\r\n";
+    assert!(buf.starts_with(http_status), "buf: {:?}", str::from_utf8(&buf));
 }
 
 #[tokio::test]
@@ -137,7 +133,8 @@ async fn socks5_relay_aead() {
     .await
     .unwrap();
 
-    let req = b"GET /success.txt HTTP/1.0\r\nHost: detectportal.firefox.com\r\nAccept: */*\r\n\r\n";
+    let req =
+        b"GET /success.txt HTTP/1.1\r\nHost: detectportal.firefox.com\r\nAccept: */*\r\nConnection: close\r\n\r\n";
     c.write_all(req).await.unwrap();
     c.flush().await.unwrap();
 
@@ -146,6 +143,10 @@ async fn socks5_relay_aead() {
     let mut buf = Vec::new();
     r.read_until(b'\n', &mut buf).await.unwrap();
 
-    let http_status = b"HTTP/1.0 200 OK\r\n";
-    assert!(buf.starts_with(http_status));
+    let http_status = b"HTTP/1.1 200 OK\r\n";
+    assert!(
+        buf.starts_with(http_status),
+        "HTTP status line mismatched, got: {:?}",
+        ByteStr::new(&buf)
+    );
 }

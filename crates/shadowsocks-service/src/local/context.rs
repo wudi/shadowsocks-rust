@@ -1,5 +1,6 @@
 //! Shadowsocks Local Server Context
 
+use std::io;
 use std::sync::Arc;
 #[cfg(feature = "local-dns")]
 use std::{net::IpAddr, time::Duration};
@@ -15,8 +16,17 @@ use shadowsocks::{
 };
 #[cfg(feature = "local-dns")]
 use tokio::sync::Mutex;
+#[cfg(feature = "local-fake-dns")]
+use tokio::sync::RwLock;
 
-use crate::{acl::AccessControl, config::SecurityConfig, net::FlowStat};
+use crate::{
+    acl::{AccessControl, AccessControlHandle},
+    config::{OutboundProxy, SecurityConfig},
+    net::{FlowStat, OutboundProxyClient},
+};
+
+#[cfg(feature = "local-fake-dns")]
+use super::fake_dns::manager::FakeDnsManager;
 
 /// Local Service Context
 #[derive(Clone)]
@@ -25,37 +35,47 @@ pub struct ServiceContext {
     connect_opts: ConnectOpts,
     accept_opts: AcceptOpts,
 
-    // Access Control
-    acl: Option<Arc<AccessControl>>,
+    // Access Control. Wrapped in `AccessControlHandle` so the active rules can be hot-reloaded
+    // without interrupting the service. Cloned contexts share the same handle.
+    acl: Option<Arc<AccessControlHandle>>,
 
     // Flow statistic report
     flow_stat: Arc<FlowStat>,
 
+    // Outbound proxy chain (sslocal -> ss-server connection routes through these proxies)
+    outbound_client: Option<Arc<OutboundProxyClient>>,
+
     // For DNS relay's ACL domain name reverse lookup -- whether the IP shall be forwarded
     #[cfg(feature = "local-dns")]
     reverse_lookup_cache: Arc<Mutex<LruCache<IpAddr, bool>>>,
+
+    #[cfg(feature = "local-fake-dns")]
+    fake_dns_manager: Arc<RwLock<Vec<Arc<FakeDnsManager>>>>,
 }
 
 impl Default for ServiceContext {
     fn default() -> Self {
-        ServiceContext::new()
+        Self::new()
     }
 }
 
 impl ServiceContext {
     /// Create a new `ServiceContext`
-    pub fn new() -> ServiceContext {
-        ServiceContext {
+    pub fn new() -> Self {
+        Self {
             context: Context::new_shared(ServerType::Local),
             connect_opts: ConnectOpts::default(),
             accept_opts: AcceptOpts::default(),
             acl: None,
             flow_stat: Arc::new(FlowStat::new()),
+            outbound_client: None,
             #[cfg(feature = "local-dns")]
             reverse_lookup_cache: Arc::new(Mutex::new(LruCache::with_expiry_duration_and_capacity(
                 Duration::from_secs(3 * 24 * 60 * 60),
                 10240, // XXX: It should be enough for a normal user.
             ))),
+            #[cfg(feature = "local-fake-dns")]
+            fake_dns_manager: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -90,13 +110,58 @@ impl ServiceContext {
     }
 
     /// Set Access Control List
+    ///
+    /// This creates a new [`AccessControlHandle`]. Contexts cloned before this call keep sharing
+    /// the previous handle, which is how a private ACL overrides the global one.
     pub fn set_acl(&mut self, acl: Arc<AccessControl>) {
-        self.acl = Some(acl);
+        self.acl = Some(Arc::new(AccessControlHandle::from(acl)));
     }
 
-    /// Get Access Control List reference
-    pub fn acl(&self) -> Option<&AccessControl> {
-        self.acl.as_deref()
+    /// Get a snapshot of the Access Control List
+    ///
+    /// Returns `None` if no ACL is configured. The returned `Arc` stays valid even if
+    /// the rules are hot-reloaded afterwards.
+    pub fn acl(&self) -> Option<Arc<AccessControl>> {
+        self.acl.as_ref().map(|handle| handle.acl())
+    }
+
+    /// Hot-reload the ACL file
+    ///
+    /// Re-reads the file that the active rules were loaded from and swaps in the new
+    /// rules atomically. Established connections are not affected; only new
+    /// connections will be checked against the new rules.
+    ///
+    /// If the file cannot be read or parsed, the previous rules stay active and the
+    /// error is returned. Does nothing if no ACL is configured.
+    pub async fn reload_acl(&self) -> io::Result<()> {
+        use log::warn;
+
+        let Some(handle) = self.acl.as_ref() else {
+            warn!("ACL reload requested, but no ACL is configured");
+            return Ok(());
+        };
+
+        handle.reload()?;
+
+        // Decisions derived from the old rules must not outlive them
+        #[cfg(feature = "local-dns")]
+        self.reverse_lookup_cache.lock().await.clear();
+
+        Ok(())
+    }
+
+    /// Set outbound proxy chain (connection to SS server routes through these proxies)
+    pub fn set_outbound_proxies(&mut self, proxies: Vec<OutboundProxy>) {
+        self.outbound_client = if proxies.is_empty() {
+            None
+        } else {
+            Some(Arc::new(OutboundProxyClient::from_config(&proxies)))
+        };
+    }
+
+    /// Get the outbound proxy client (if a chain is configured).
+    pub fn outbound_client(&self) -> Option<&Arc<OutboundProxyClient>> {
+        self.outbound_client.as_ref()
     }
 
     /// Get cloned flow statistic
@@ -122,12 +187,12 @@ impl ServiceContext {
 
     /// Check if target should be bypassed
     pub async fn check_target_bypassed(&self, addr: &Address) -> bool {
-        match self.acl {
+        match self.acl() {
             None => false,
-            Some(ref acl) => {
+            Some(acl) => {
                 #[cfg(feature = "local-dns")]
                 {
-                    if let Address::SocketAddress(ref saddr) = addr {
+                    if let Address::SocketAddress(saddr) = addr {
                         // do the reverse lookup in our local cache
                         let mut reverse_lookup_cache = self.reverse_lookup_cache.lock().await;
                         // if a qname is found
@@ -146,10 +211,10 @@ impl ServiceContext {
     #[cfg(feature = "local-dns")]
     pub async fn add_to_reverse_lookup_cache(&self, addr: IpAddr, forward: bool) {
         let is_exception = forward
-            != match self.acl {
+            != match self.acl() {
                 // Proxy everything by default
                 None => true,
-                Some(ref a) => a.check_ip_in_proxy_list(&addr),
+                Some(acl) => acl.check_ip_in_proxy_list(&addr),
             };
         let mut reverse_lookup_cache = self.reverse_lookup_cache.lock().await;
         match reverse_lookup_cache.get_mut(&addr) {
@@ -179,5 +244,32 @@ impl ServiceContext {
     pub fn set_security_config(&mut self, security: &SecurityConfig) {
         let context = Arc::get_mut(&mut self.context).expect("cannot set security on a shared context");
         context.set_replay_attack_policy(security.replay_attack.policy);
+    }
+
+    /// Set Fake DNS manager
+    #[cfg(feature = "local-fake-dns")]
+    pub async fn add_fake_dns_manager(&self, manager: Arc<FakeDnsManager>) {
+        let mut managers = self.fake_dns_manager.write().await;
+        managers.push(manager);
+    }
+
+    /// Fake DNS maps IP to Domain
+    #[cfg(feature = "local-fake-dns")]
+    pub async fn try_map_fake_address(&self, addr: &Address) -> Option<Address> {
+        let socket_addr = match addr {
+            Address::DomainNameAddress(..) => return None,
+            Address::SocketAddress(socket_addr) => socket_addr,
+        };
+        let ip_addr = socket_addr.ip();
+
+        for mgr in self.fake_dns_manager.read().await.iter() {
+            if let Ok(Some(name)) = mgr.map_ip_domain(ip_addr).await {
+                let new_addr = Address::DomainNameAddress(name.to_string(), socket_addr.port());
+                log::trace!("fakedns mapped {} -> {}", addr, new_addr);
+                return Some(new_addr);
+            }
+        }
+
+        None
     }
 }

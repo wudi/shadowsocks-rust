@@ -70,6 +70,8 @@ pub mod net;
 #[cfg(feature = "server")]
 pub mod server;
 mod sys;
+#[cfg(any(feature = "local", feature = "server"))]
+mod utils;
 
 /// Default UDP association's expire duration
 #[allow(dead_code)]

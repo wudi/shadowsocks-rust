@@ -11,21 +11,24 @@ use tokio::{
 
 use shadowsocks_service::{
     config::{Config, ConfigType},
-    run_local,
-    run_server,
+    run_local, run_server,
 };
 
-fn random_local_tcp_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+fn random_local_tcp_port_pair() -> (u16, u16) {
+    let listener1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port1 = listener1.local_addr().unwrap().port();
+
+    let listener2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port2 = listener2.local_addr().unwrap().port();
+
+    (port1, port2)
 }
 
 #[tokio::test]
 async fn tcp_tunnel() {
     let _ = env_logger::try_init();
 
-    let local_port = random_local_tcp_port();
-    let server_port = random_local_tcp_port();
+    let (local_port, server_port) = random_local_tcp_port_pair();
     let local_config = Config::load_from_str(
         &format!(
             r#"{{
@@ -64,12 +67,13 @@ async fn tcp_tunnel() {
     tokio::spawn(run_local(local_config));
     tokio::spawn(run_server(server_config));
 
-    time::sleep(Duration::from_secs(1)).await;
+    time::sleep(Duration::from_secs(5)).await;
 
     // Connect it directly, because it is now established a TCP tunnel with detectportal.firefox.com
     let mut stream = TcpStream::connect(("127.0.0.1", local_port)).await.unwrap();
 
-    let req = b"GET /success.txt HTTP/1.0\r\nHost: detectportal.firefox.com\r\nAccept: */*\r\n\r\n";
+    let req =
+        b"GET /success.txt HTTP/1.1\r\nHost: detectportal.firefox.com\r\nAccept: */*\r\nConnection: close\r\n\r\n";
     stream.write_all(req).await.unwrap();
     stream.flush().await.unwrap();
 
@@ -78,19 +82,25 @@ async fn tcp_tunnel() {
     let mut buf = Vec::new();
     r.read_until(b'\n', &mut buf).await.unwrap();
 
-    let http_status = b"HTTP/1.0 200 OK\r\n";
-    assert!(buf.starts_with(http_status));
+    let http_status = b"HTTP/1.1 200 OK\r\n";
+    assert!(
+        buf.starts_with(http_status),
+        "HTTP status line mismatched, got: {:?}",
+        ByteStr::new(&buf)
+    );
 }
 
 #[tokio::test]
 async fn udp_tunnel() {
     let _ = env_logger::try_init();
 
-    // A UDP echo server
-    tokio::spawn(async {
-        let socket = UdpSocket::bind("127.0.0.1:9230").await.unwrap();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let socket_local_addr = socket.local_addr().unwrap();
+    let echo_server_port = socket_local_addr.port();
 
-        debug!("UDP echo server listening on 127.0.0.1:9230");
+    // A UDP echo server
+    tokio::spawn(async move {
+        debug!("UDP echo server listening on {socket_local_addr}");
 
         let mut buffer = [0u8; 65536];
         loop {
@@ -102,8 +112,7 @@ async fn udp_tunnel() {
 
     time::sleep(Duration::from_secs(1)).await;
 
-    let local_port = random_local_tcp_port();
-    let server_port = random_local_tcp_port();
+    let (local_port, server_port) = random_local_tcp_port_pair();
     let local_config = Config::load_from_str(
         &format!(
             r#"{{
@@ -113,7 +122,7 @@ async fn udp_tunnel() {
                     "local_address": "127.0.0.1",
                     "protocol": "tunnel",
                     "forward_address": "127.0.0.1",
-                    "forward_port": 9230
+                    "forward_port": {echo_server_port}
                 }}
             ],
             "server": "127.0.0.1",
@@ -144,7 +153,7 @@ async fn udp_tunnel() {
     tokio::spawn(run_local(local_config));
     tokio::spawn(run_server(server_config));
 
-    time::sleep(Duration::from_secs(1)).await;
+    time::sleep(Duration::from_secs(5)).await;
 
     const MESSAGE: &[u8] = b"hello shadowsocks";
 

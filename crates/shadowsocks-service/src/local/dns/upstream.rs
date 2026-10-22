@@ -12,17 +12,18 @@ use std::{
 
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{BufMut, BytesMut};
-use hickory_resolver::proto::{
-    error::{ProtoError, ProtoErrorKind},
-    op::Message,
-};
-use log::trace;
-use rand::{thread_rng, Rng};
+use hickory_resolver::proto::{ProtoError, op::Message, serialize::binary::DecodeError};
+use log::{error, trace};
+use lru_time_cache::{Entry, LruCache};
 use shadowsocks::{
     config::ServerConfig,
     context::SharedContext,
     net::{ConnectOpts, TcpStream as ShadowTcpStream, UdpSocket as ShadowUdpSocket},
-    relay::{tcprelay::ProxyClientStream, udprelay::ProxySocket, Address},
+    relay::{
+        Address,
+        tcprelay::ProxyClientStream,
+        udprelay::{ProxySocket, options::UdpSocketControlData},
+    },
 };
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -32,7 +33,39 @@ use tokio::{
     time,
 };
 
-use crate::net::{FlowStat, MonProxySocket, MonProxyStream};
+use crate::{
+    DEFAULT_UDP_EXPIRY_DURATION,
+    local::net::udp::generate_client_session_id,
+    net::{FlowStat, MonProxySocket, MonProxyStream, packet_window::PacketWindowFilter},
+};
+
+/// DnsClient API errors
+#[derive(thiserror::Error, Debug)]
+pub enum DnsClientError {
+    /// hickory-dns proto DecodeError
+    #[error("{0}")]
+    DnsDecodeError(#[from] DecodeError),
+
+    /// hickory-dns proto ProtoError
+    #[error("{0}")]
+    DnsProtoError(#[from] ProtoError),
+
+    /// std::io::Error
+    #[error("{0}")]
+    IoError(#[from] io::Error),
+
+    #[error("UDP packet id overflows")]
+    UdpPacketIdOverflows,
+
+    #[error("UDP packet id out of window")]
+    UdpPacketIdOutOfWindow,
+
+    #[error("Timeout")]
+    Timeout,
+}
+
+/// DnsClient API Result<T> type
+pub type DnsClientResult<T> = Result<T, DnsClientError>;
 
 /// Collection of various DNS connections
 #[allow(clippy::large_enum_variant)]
@@ -52,29 +85,31 @@ pub enum DnsClient {
         stream: ProxyClientStream<MonProxyStream<ShadowTcpStream>>,
     },
     UdpRemote {
-        socket: MonProxySocket,
+        socket: MonProxySocket<ShadowUdpSocket>,
         ns: Address,
+        control: UdpSocketControlData,
+        server_windows: LruCache<u64, PacketWindowFilter>,
     },
 }
 
 impl DnsClient {
     /// Connect to local provided TCP DNS server
-    pub async fn connect_tcp_local(ns: SocketAddr, connect_opts: &ConnectOpts) -> io::Result<DnsClient> {
+    pub async fn connect_tcp_local(ns: SocketAddr, connect_opts: &ConnectOpts) -> io::Result<Self> {
         let stream = ShadowTcpStream::connect_with_opts(&ns, connect_opts).await?;
-        Ok(DnsClient::TcpLocal { stream })
+        Ok(Self::TcpLocal { stream })
     }
 
     /// Connect to local provided UDP DNS server
-    pub async fn connect_udp_local(ns: SocketAddr, connect_opts: &ConnectOpts) -> io::Result<DnsClient> {
+    pub async fn connect_udp_local(ns: SocketAddr, connect_opts: &ConnectOpts) -> io::Result<Self> {
         let socket = ShadowUdpSocket::connect_with_opts(&ns, connect_opts).await?.into();
-        Ok(DnsClient::UdpLocal { socket })
+        Ok(Self::UdpLocal { socket })
     }
 
     #[cfg(unix)]
     /// Connect to local provided Unix Domain Socket DNS server, in TCP-like protocol
-    pub async fn connect_unix_stream<P: AsRef<Path>>(path: &P) -> io::Result<DnsClient> {
+    pub async fn connect_unix_stream<P: AsRef<Path>>(path: &P) -> io::Result<Self> {
         let stream = UnixStream::connect(path).await?;
-        Ok(DnsClient::UnixStream { stream })
+        Ok(Self::UnixStream { stream })
     }
 
     /// Connect to remote DNS server through proxy in TCP
@@ -84,12 +119,12 @@ impl DnsClient {
         ns: &Address,
         connect_opts: &ConnectOpts,
         flow_stat: Arc<FlowStat>,
-    ) -> io::Result<DnsClient> {
+    ) -> io::Result<Self> {
         let stream = ProxyClientStream::connect_with_opts_map(context, svr_cfg, ns, connect_opts, |s| {
             MonProxyStream::from_stream(s, flow_stat)
         })
         .await?;
-        Ok(DnsClient::TcpRemote { stream })
+        Ok(Self::TcpRemote { stream })
     }
 
     /// Connect to remote DNS server through proxy in UDP
@@ -99,55 +134,87 @@ impl DnsClient {
         ns: Address,
         connect_opts: &ConnectOpts,
         flow_stat: Arc<FlowStat>,
-    ) -> io::Result<DnsClient> {
-        let socket = ProxySocket::connect_with_opts(context, svr_cfg, connect_opts).await?;
-        let socket = MonProxySocket::from_socket(socket, flow_stat);
-        Ok(DnsClient::UdpRemote { socket, ns })
+    ) -> io::Result<Self> {
+        let socket = ProxySocket::connect_with_opts(context.clone(), svr_cfg, connect_opts).await?;
+        let socket = MonProxySocket::from_socket(socket, flow_stat.clone());
+        let mut control = UdpSocketControlData::default();
+        control.client_session_id = generate_client_session_id();
+        control.packet_id = 0; // AEAD-2022 Packet ID starts from 1
+        Ok(Self::UdpRemote {
+            socket,
+            ns,
+            control,
+            // NOTE: expiry duration should be configurable. But the Client is held by DnsClientCache, which expires very quickly.
+            server_windows: LruCache::with_expiry_duration(DEFAULT_UDP_EXPIRY_DURATION),
+        })
     }
 
     /// Make a DNS lookup
     #[allow(dead_code)]
-    pub async fn lookup(&mut self, mut msg: Message) -> Result<Message, ProtoError> {
+    pub async fn lookup(&mut self, mut msg: Message) -> DnsClientResult<Message> {
         self.inner_lookup(&mut msg).await
     }
 
     /// Make a DNS lookup with timeout
-    pub async fn lookup_timeout(&mut self, mut msg: Message, timeout: Duration) -> Result<Message, ProtoError> {
+    pub async fn lookup_timeout(&mut self, mut msg: Message, timeout: Duration) -> DnsClientResult<Message> {
         match time::timeout(timeout, self.inner_lookup(&mut msg)).await {
             Ok(Ok(msg)) => Ok(msg),
             Ok(Err(error)) => Err(error),
-            Err(..) => Err(ProtoErrorKind::Timeout.into()),
+            Err(..) => Err(DnsClientError::Timeout),
         }
     }
 
-    async fn inner_lookup(&mut self, msg: &mut Message) -> Result<Message, ProtoError> {
-        // Make a random ID
-        msg.set_id(thread_rng().gen());
-
+    async fn inner_lookup(&mut self, msg: &mut Message) -> DnsClientResult<Message> {
         trace!("DNS lookup {:?}", msg);
 
         match *self {
-            DnsClient::TcpLocal { ref mut stream } => stream_query(stream, msg).await,
-            DnsClient::UdpLocal { ref socket } => {
+            Self::TcpLocal { ref mut stream } => stream_query(stream, msg).await,
+            Self::UdpLocal { ref socket } => {
                 let bytes = msg.to_vec()?;
                 socket.send(&bytes).await?;
 
-                let mut recv_buf = [0u8; 256];
+                let mut recv_buf = [0u8; 512];
                 let n = socket.recv(&mut recv_buf).await?;
 
-                Message::from_vec(&recv_buf[..n])
+                Message::from_vec(&recv_buf[..n]).map_err(Into::into)
             }
             #[cfg(unix)]
-            DnsClient::UnixStream { ref mut stream } => stream_query(stream, msg).await,
-            DnsClient::TcpRemote { ref mut stream } => stream_query(stream, msg).await,
-            DnsClient::UdpRemote { ref mut socket, ref ns } => {
+            Self::UnixStream { ref mut stream } => stream_query(stream, msg).await,
+            Self::TcpRemote { ref mut stream } => stream_query(stream, msg).await,
+            Self::UdpRemote {
+                ref mut socket,
+                ref ns,
+                ref mut control,
+                ref mut server_windows,
+            } => {
+                control.packet_id = match control.packet_id.checked_add(1) {
+                    Some(i) => i,
+                    None => return Err(DnsClientError::UdpPacketIdOverflows),
+                };
+
                 let bytes = msg.to_vec()?;
-                socket.send(ns, &bytes).await?;
+                socket.send_with_ctrl(ns, control, &bytes).await?;
 
-                let mut recv_buf = [0u8; 256];
-                let (n, _) = socket.recv(&mut recv_buf).await?;
+                let mut recv_buf = [0u8; 512];
+                let (n, _, recv_control) = socket.recv_with_ctrl(&mut recv_buf).await?;
 
-                Message::from_vec(&recv_buf[..n])
+                if let Some(server_control) = recv_control {
+                    let filter = match server_windows.entry(server_control.server_session_id) {
+                        Entry::Occupied(occ) => occ.into_mut(),
+                        Entry::Vacant(vac) => vac.insert(PacketWindowFilter::new()),
+                    };
+
+                    if !filter.validate_packet_id(server_control.packet_id, u64::MAX) {
+                        error!(
+                            "dns client for {} packet_id {} out of window",
+                            ns, server_control.packet_id
+                        );
+
+                        return Err(DnsClientError::UdpPacketIdOutOfWindow);
+                    }
+                }
+
+                Message::from_vec(&recv_buf[..n]).map_err(Into::into)
             }
         }
     }
@@ -189,8 +256,8 @@ impl DnsClient {
         #[cfg(windows)]
         fn check_peekable<F: std::os::windows::io::AsRawSocket>(s: &mut F) -> bool {
             use windows_sys::{
+                Win32::Networking::WinSock::{MSG_PEEK, SOCKET, recv},
                 core::PSTR,
-                Win32::Networking::WinSock::{recv, MSG_PEEK, SOCKET},
             };
 
             let sock = s.as_raw_socket() as SOCKET;
@@ -216,17 +283,17 @@ impl DnsClient {
         }
 
         match *self {
-            DnsClient::TcpLocal { ref mut stream } => check_peekable(stream),
-            DnsClient::UdpLocal { .. } => true,
+            Self::TcpLocal { ref mut stream } => check_peekable(stream),
+            Self::UdpLocal { .. } => true,
             #[cfg(unix)]
-            DnsClient::UnixStream { ref mut stream } => check_peekable(stream),
-            DnsClient::TcpRemote { ref mut stream } => check_peekable(stream.get_mut().get_mut()),
-            DnsClient::UdpRemote { .. } => true,
+            Self::UnixStream { ref mut stream } => check_peekable(stream),
+            Self::TcpRemote { ref mut stream } => check_peekable(stream.get_mut().get_mut()),
+            Self::UdpRemote { .. } => true,
         }
     }
 }
 
-pub async fn stream_query<S>(stream: &mut S, r: &Message) -> Result<Message, ProtoError>
+pub async fn stream_query<S>(stream: &mut S, r: &Message) -> DnsClientResult<Message>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -251,5 +318,5 @@ where
     }
     stream.read_exact(&mut rsp_bytes).await?;
 
-    Message::from_vec(&rsp_bytes)
+    Message::from_vec(&rsp_bytes).map_err(Into::into)
 }

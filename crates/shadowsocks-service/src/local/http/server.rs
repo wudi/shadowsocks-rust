@@ -4,7 +4,7 @@
 
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
-use hyper::{server::conn::http1, service};
+use hyper::{body, server::conn::http1, service};
 use log::{error, info, trace};
 use shadowsocks::{config::ServerAddr, net::TcpListener};
 use tokio::{
@@ -16,7 +16,7 @@ use crate::local::{
     context::ServiceContext, loadbalancing::PingBalancer, net::tcp::listener::create_standard_tcp_listener,
 };
 
-use super::{http_client::HttpClient, http_service::HttpService, tokio_rt::TokioIo};
+use super::{config::HttpAuthConfig, http_client::HttpClient, http_service::HttpService, tokio_rt::TokioIo};
 
 /// HTTP Local server builder
 pub struct HttpBuilder {
@@ -25,27 +25,25 @@ pub struct HttpBuilder {
     balancer: PingBalancer,
     #[cfg(target_os = "macos")]
     launchd_tcp_socket_name: Option<String>,
+    http_auth: HttpAuthConfig,
 }
 
 impl HttpBuilder {
     /// Create a new HTTP Local server builder
-    pub fn new(client_config: ServerAddr, balancer: PingBalancer) -> HttpBuilder {
+    pub fn new(client_config: ServerAddr, balancer: PingBalancer) -> Self {
         let context = ServiceContext::new();
-        HttpBuilder::with_context(Arc::new(context), client_config, balancer)
+        Self::with_context(Arc::new(context), client_config, balancer)
     }
 
     /// Create with an existed context
-    pub fn with_context(
-        context: Arc<ServiceContext>,
-        client_config: ServerAddr,
-        balancer: PingBalancer,
-    ) -> HttpBuilder {
-        HttpBuilder {
+    pub fn with_context(context: Arc<ServiceContext>, client_config: ServerAddr, balancer: PingBalancer) -> Self {
+        Self {
             context,
             client_config,
             balancer,
             #[cfg(target_os = "macos")]
             launchd_tcp_socket_name: None,
+            http_auth: HttpAuthConfig::default(),
         }
     }
 
@@ -54,19 +52,25 @@ impl HttpBuilder {
         self.launchd_tcp_socket_name = Some(n);
     }
 
+    pub fn set_http_auth(&mut self, auth: HttpAuthConfig) {
+        self.http_auth = auth;
+    }
+
     /// Build HTTP server instance
     pub async fn build(self) -> io::Result<Http> {
         cfg_if::cfg_if! {
             if #[cfg(target_os = "macos")] {
-                let listener = if let Some(launchd_socket_name) = self.launchd_tcp_socket_name {
-                    use tokio::net::TcpListener as TokioTcpListener;
-                    use crate::net::launch_activate_socket::get_launch_activate_tcp_listener;
+                let listener = match self.launchd_tcp_socket_name {
+                    Some(launchd_socket_name) => {
+                        use tokio::net::TcpListener as TokioTcpListener;
+                        use crate::net::launch_activate_socket::get_launch_activate_tcp_listener;
 
-                    let std_listener = get_launch_activate_tcp_listener(&launchd_socket_name)?;
-                    let tokio_listener = TokioTcpListener::from_std(std_listener)?;
-                    TcpListener::from_listener(tokio_listener, self.context.accept_opts())?
-                } else {
-                    create_standard_tcp_listener(&self.context, &self.client_config).await?
+                        let std_listener = get_launch_activate_tcp_listener(&launchd_socket_name, true)?;
+                        let tokio_listener = TokioTcpListener::from_std(std_listener)?;
+                        TcpListener::from_listener(tokio_listener, self.context.accept_opts())?
+                    } _ => {
+                        create_standard_tcp_listener(&self.context, &self.client_config).await?
+                    }
                 };
             } else {
                 let listener = create_standard_tcp_listener(&self.context, &self.client_config).await?;
@@ -79,6 +83,7 @@ impl HttpBuilder {
             context: self.context,
             listener,
             balancer: self.balancer,
+            http_auth: Arc::new(self.http_auth),
         })
     }
 }
@@ -88,6 +93,7 @@ pub struct Http {
     context: Arc<ServiceContext>,
     listener: TcpListener,
     balancer: PingBalancer,
+    http_auth: Arc<HttpAuthConfig>,
 }
 
 impl Http {
@@ -106,7 +112,7 @@ impl Http {
             self.listener.local_addr().expect("http local_addr")
         );
 
-        let handler = HttpConnectionHandler::new(self.context, self.balancer);
+        let handler = HttpConnectionHandler::new(self.context, self.balancer, self.http_auth);
 
         loop {
             let (stream, peer_addr) = match self.listener.accept().await {
@@ -119,7 +125,12 @@ impl Http {
             };
 
             trace!("HTTP accepted client from {}", peer_addr);
-            tokio::spawn(handler.clone().serve_connection(stream, peer_addr));
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                if let Err(err) = handler.serve_connection(stream, peer_addr).await {
+                    error!("HTTP connection {} handler failed with error: {}", peer_addr, err);
+                }
+            });
         }
     }
 }
@@ -131,49 +142,55 @@ impl Http {
 pub struct HttpConnectionHandler {
     context: Arc<ServiceContext>,
     balancer: PingBalancer,
-    http_client: HttpClient,
+    http_client: HttpClient<body::Incoming>,
+    http_auth: Arc<HttpAuthConfig>,
 }
 
 impl HttpConnectionHandler {
     /// Create a new Handler
-    pub fn new(context: Arc<ServiceContext>, balancer: PingBalancer) -> HttpConnectionHandler {
-        HttpConnectionHandler {
+    pub fn new(context: Arc<ServiceContext>, balancer: PingBalancer, http_auth: Arc<HttpAuthConfig>) -> Self {
+        Self {
             context,
             balancer,
             http_client: HttpClient::new(),
+            http_auth,
         }
     }
 
     /// Handle a TCP HTTP connection
-    pub async fn serve_connection<S>(self, stream: S, peer_addr: SocketAddr)
+    pub async fn serve_connection<S>(self, stream: S, peer_addr: SocketAddr) -> hyper::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let HttpConnectionHandler {
+        let Self {
             context,
             balancer,
             http_client,
+            http_auth,
         } = self;
 
         let io = TokioIo::new(stream);
 
         // NOTE: Some stupid clients requires HTTP header keys to be case-sensitive.
         // For example: Nintendo Switch
-        if let Err(err) = http1::Builder::new()
+        http1::Builder::new()
             .keep_alive(true)
             .title_case_headers(true)
             .preserve_header_case(true)
             .serve_connection(
                 io,
                 service::service_fn(move |req| {
-                    HttpService::new(context.clone(), peer_addr, http_client.clone(), balancer.clone())
-                        .serve_connection(req)
+                    HttpService::new(
+                        context.clone(),
+                        peer_addr,
+                        http_client.clone(),
+                        balancer.clone(),
+                        http_auth.clone(),
+                    )
+                    .serve_connection(req)
                 }),
             )
             .with_upgrades()
             .await
-        {
-            error!("failed to serve HTTP connection, error: {}", err);
-        }
     }
 }

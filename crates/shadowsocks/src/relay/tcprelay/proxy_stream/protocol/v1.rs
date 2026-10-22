@@ -7,13 +7,14 @@ use tokio::io::AsyncRead;
 
 use crate::relay::socks5::Address;
 
+#[derive(Debug)]
 pub struct StreamTcpRequestHeader {
     pub addr: Address,
 }
 
 impl StreamTcpRequestHeader {
-    pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<StreamTcpRequestHeader> {
-        Ok(StreamTcpRequestHeader {
+    pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Self> {
+        Ok(Self {
             addr: Address::read_from(reader).await?,
         })
     }
@@ -27,11 +28,12 @@ impl StreamTcpRequestHeader {
     }
 }
 
+#[derive(Debug)]
 pub struct StreamTcpRequestHeaderRef<'a> {
     pub addr: &'a Address,
 }
 
-impl<'a> StreamTcpRequestHeaderRef<'a> {
+impl StreamTcpRequestHeaderRef<'_> {
     pub fn write_to_buf<B: BufMut>(&self, buf: &mut B) {
         self.addr.write_to_buf(buf);
     }

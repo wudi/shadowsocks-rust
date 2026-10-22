@@ -4,10 +4,9 @@
 use std::path::PathBuf;
 use std::{
     collections::HashMap,
-    error,
     fmt::{self, Debug, Display},
     net::SocketAddr,
-    str::FromStr,
+    str::{self, FromStr},
     sync::Arc,
     time::Duration,
 };
@@ -16,15 +15,13 @@ use base64::Engine as _;
 use byte_string::ByteStr;
 use bytes::Bytes;
 use cfg_if::cfg_if;
-use log::error;
+use log::{error, warn};
 use thiserror::Error;
 use url::{self, Url};
 
-use crate::{
-    crypto::{v1::openssl_bytes_to_key, CipherKind},
-    plugin::PluginConfig,
-    relay::socks5::Address,
-};
+#[cfg(any(feature = "stream-cipher", feature = "aead-cipher"))]
+use crate::crypto::v1::openssl_bytes_to_key;
+use crate::{crypto::CipherKind, plugin::PluginConfig, relay::socks5::Address};
 
 const USER_KEY_BASE64_ENGINE: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
     &base64::alphabet::STANDARD,
@@ -61,12 +58,12 @@ pub enum ServerType {
 impl ServerType {
     /// Check if it is `Local`
     pub fn is_local(self) -> bool {
-        self == ServerType::Local
+        self == Self::Local
     }
 
     /// Check if it is `Server`
     pub fn is_server(self) -> bool {
-        self == ServerType::Server
+        self == Self::Server
     }
 }
 
@@ -81,34 +78,39 @@ pub enum Mode {
 impl Mode {
     /// Check if UDP is enabled
     pub fn enable_udp(self) -> bool {
-        matches!(self, Mode::UdpOnly | Mode::TcpAndUdp)
+        matches!(self, Self::UdpOnly | Self::TcpAndUdp)
     }
 
     /// Check if TCP is enabled
     pub fn enable_tcp(self) -> bool {
-        matches!(self, Mode::TcpOnly | Mode::TcpAndUdp)
+        matches!(self, Self::TcpOnly | Self::TcpAndUdp)
     }
 
     /// Merge with another Mode
-    pub fn merge(&self, mode: Mode) -> Mode {
+    pub fn merge(&self, mode: Self) -> Self {
         let me = *self as u8;
         let fm = mode as u8;
         match me | fm {
-            0x01 => Mode::TcpOnly,
-            0x02 => Mode::UdpOnly,
-            0x03 => Mode::TcpAndUdp,
+            0x01 => Self::TcpOnly,
+            0x02 => Self::UdpOnly,
+            0x03 => Self::TcpAndUdp,
             _ => unreachable!(),
+        }
+    }
+
+    /// String representation of Mode
+    pub fn as_str(&self) -> &'static str {
+        match *self {
+            Self::TcpOnly => "tcp_only",
+            Self::TcpAndUdp => "tcp_and_udp",
+            Self::UdpOnly => "udp_only",
         }
     }
 }
 
 impl fmt::Display for Mode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Mode::TcpOnly => f.write_str("tcp_only"),
-            Mode::TcpAndUdp => f.write_str("tcp_and_udp"),
-            Mode::UdpOnly => f.write_str("udp_only"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -117,11 +119,79 @@ impl FromStr for Mode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "tcp_only" => Ok(Mode::TcpOnly),
-            "tcp_and_udp" => Ok(Mode::TcpAndUdp),
-            "udp_only" => Ok(Mode::UdpOnly),
+            "tcp_only" => Ok(Self::TcpOnly),
+            "tcp_and_udp" => Ok(Self::TcpAndUdp),
+            "udp_only" => Ok(Self::UdpOnly),
             _ => Err(()),
         }
+    }
+}
+
+struct ModeVisitor;
+
+impl serde::de::Visitor<'_> for ModeVisitor {
+    type Value = Mode;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("Mode")
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match v.parse::<Mode>() {
+            Ok(m) => Ok(m),
+            Err(_) => Err(serde::de::Error::invalid_value(serde::de::Unexpected::Str(v), &self)),
+        }
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str::<E>(v.as_str())
+    }
+
+    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match str::from_utf8(v) {
+            Ok(v) => self.visit_str(v),
+            Err(_) => Err(serde::de::Error::invalid_value(serde::de::Unexpected::Bytes(v), &self)),
+        }
+    }
+
+    fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match String::from_utf8(v) {
+            Ok(v) => self.visit_string(v),
+            Err(e) => Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Bytes(&e.into_bytes()),
+                &self,
+            )),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Mode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_string(ModeVisitor)
+    }
+}
+
+impl serde::Serialize for Mode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -136,14 +206,14 @@ pub struct ServerWeight {
 
 impl Default for ServerWeight {
     fn default() -> Self {
-        ServerWeight::new()
+        Self::new()
     }
 }
 
 impl ServerWeight {
     /// Creates a default weight for server, which will have 1.0 for both TCP and UDP
-    pub fn new() -> ServerWeight {
-        ServerWeight {
+    pub fn new() -> Self {
+        Self {
             tcp_weight: 1.0,
             udp_weight: 1.0,
         }
@@ -192,7 +262,7 @@ impl Debug for ServerUser {
 
 impl ServerUser {
     /// Create a user
-    pub fn new<N, K>(name: N, key: K) -> ServerUser
+    pub fn new<N, K>(name: N, key: K) -> Self
     where
         N: Into<String>,
         K: Into<Bytes>,
@@ -203,7 +273,7 @@ impl ServerUser {
         let hash = blake3::hash(&key);
         let identity_hash = Bytes::from(hash.as_bytes()[0..16].to_owned());
 
-        ServerUser {
+        Self {
             name,
             key,
             identity_hash,
@@ -211,12 +281,12 @@ impl ServerUser {
     }
 
     /// Create a user from encoded key
-    pub fn with_encoded_key<N>(name: N, key: &str) -> Result<ServerUser, ServerUserError>
+    pub fn with_encoded_key<N>(name: N, key: &str) -> Result<Self, ServerUserError>
     where
         N: Into<String>,
     {
         let key = USER_KEY_BASE64_ENGINE.decode(key)?;
-        Ok(ServerUser::new(name, key))
+        Ok(Self::new(name, key))
     }
 
     /// Name of the user
@@ -265,8 +335,8 @@ pub struct ServerUserManager {
 
 impl ServerUserManager {
     /// Create a new manager
-    pub fn new() -> ServerUserManager {
-        ServerUserManager { users: HashMap::new() }
+    pub fn new() -> Self {
+        Self { users: HashMap::new() }
     }
 
     /// Add a new user
@@ -296,9 +366,38 @@ impl ServerUserManager {
 }
 
 impl Default for ServerUserManager {
-    fn default() -> ServerUserManager {
-        ServerUserManager::new()
+    fn default() -> Self {
+        Self::new()
     }
+}
+
+/// The source of the ServerConfig
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ServerSource {
+    Default,       //< Default source, created in code
+    Configuration, //< Created from configuration
+    CommandLine,   //< Created from command line
+    OnlineConfig,  //< Created from online configuration (SIP008)
+}
+
+/// Errors when creating a new ServerConfig
+#[derive(Debug, Clone, Error)]
+pub enum ServerConfigError {
+    /// Invalid base64 encoding of password
+    #[error("invalid key encoding for {0}, {1}")]
+    InvalidKeyEncoding(CipherKind, base64::DecodeError),
+
+    /// Invalid user key encoding
+    #[error("invalid iPSK encoding for {0}, {1}")]
+    InvalidUserKeyEncoding(CipherKind, base64::DecodeError),
+
+    /// Key length mismatch
+    #[error("invalid key length for {0}, expecting {1} bytes, but found {2} bytes")]
+    InvalidKeyLength(CipherKind, usize, usize),
+
+    /// User Key (ipsk) length mismatch
+    #[error("invalid user key length for {0}, expecting {1} bytes, but found {2} bytes")]
+    InvalidUserKeyLength(CipherKind, usize, usize),
 }
 
 /// Configuration for a server
@@ -340,39 +439,44 @@ pub struct ServerConfig {
 
     /// Weight
     weight: ServerWeight,
+
+    /// Source
+    source: ServerSource,
 }
 
-#[cfg(feature = "aead-cipher-2022")]
 #[inline]
-fn make_derived_key(method: CipherKind, password: &str, enc_key: &mut [u8]) {
+fn make_derived_key(method: CipherKind, password: &str, enc_key: &mut [u8]) -> Result<(), ServerConfigError> {
+    #[cfg(feature = "aead-cipher-2022")]
     if method.is_aead_2022() {
         // AEAD 2022 password is a base64 form of enc_key
         match AEAD2022_PASSWORD_BASE64_ENGINE.decode(password) {
             Ok(v) => {
                 if v.len() != enc_key.len() {
-                    panic!(
-                        "{} is expecting a {} bytes key, but password: {} ({} bytes after decode)",
-                        method,
-                        enc_key.len(),
-                        password,
-                        v.len()
-                    );
+                    return Err(ServerConfigError::InvalidKeyLength(method, enc_key.len(), v.len()));
                 }
                 enc_key.copy_from_slice(&v);
             }
             Err(err) => {
-                panic!("{method} password {password} is not base64 encoded, error: {err}");
+                return Err(ServerConfigError::InvalidKeyEncoding(method, err));
             }
         }
-    } else {
-        openssl_bytes_to_key(password.as_bytes(), enc_key);
-    }
-}
 
-#[cfg(not(feature = "aead-cipher-2022"))]
-#[inline]
-fn make_derived_key(_method: CipherKind, password: &str, enc_key: &mut [u8]) {
-    openssl_bytes_to_key(password.as_bytes(), enc_key);
+        return Ok(());
+    }
+
+    cfg_if! {
+        if #[cfg(any(feature = "stream-cipher", feature = "aead-cipher"))] {
+            let _ = method;
+            openssl_bytes_to_key(password.as_bytes(), enc_key);
+
+            Ok(())
+        } else {
+            // No default implementation.
+            let _ = password;
+            let _ = enc_key;
+            unreachable!("{method} don't know how to make a derived key");
+        }
+    }
 }
 
 /// Check if method supports Extended Identity Header
@@ -387,11 +491,39 @@ pub fn method_support_eih(method: CipherKind) -> bool {
     )
 }
 
-fn password_to_keys<P>(method: CipherKind, password: P) -> (String, Box<[u8]>, Vec<Bytes>)
+#[allow(clippy::type_complexity)]
+fn password_to_keys<P>(method: CipherKind, password: P) -> Result<(String, Box<[u8]>, Vec<Bytes>), ServerConfigError>
 where
     P: Into<String>,
 {
     let password = password.into();
+
+    match method {
+        CipherKind::NONE => {
+            // NONE method's key length is 0
+            debug_assert_eq!(method.key_len(), 0);
+
+            if !password.is_empty() {
+                warn!(
+                    "method \"none\" doesn't need a password, which should be set as an empty String, but password.len() = {}",
+                    password.len()
+                );
+            }
+
+            return Ok((password, Vec::new().into_boxed_slice(), Vec::new()));
+        }
+
+        #[cfg(feature = "stream-cipher")]
+        CipherKind::SS_TABLE => {
+            // TABLE cipher doesn't need key derivation.
+            // Reference implementation: shadowsocks-libev, shadowsocks (Python)
+            let enc_key = password.clone().into_bytes().into_boxed_slice();
+            return Ok((password, enc_key, Vec::new()));
+        }
+
+        #[allow(unreachable_patterns)]
+        _ => {}
+    }
 
     #[cfg(feature = "aead-cipher-2022")]
     if method_support_eih(method) {
@@ -405,40 +537,56 @@ where
         let upsk = split_iter.next().expect("uPSK");
 
         let mut enc_key = vec![0u8; method.key_len()].into_boxed_slice();
-        make_derived_key(method, upsk, &mut enc_key);
+        make_derived_key(method, upsk, &mut enc_key)?;
 
         for ipsk in split_iter {
             match USER_KEY_BASE64_ENGINE.decode(ipsk) {
                 Ok(v) => {
+                    // Double check identity key's length
+                    match method {
+                        CipherKind::AEAD2022_BLAKE3_AES_128_GCM => {
+                            // AES-128
+                            if v.len() != 16 {
+                                return Err(ServerConfigError::InvalidUserKeyLength(method, 16, v.len()));
+                            }
+                        }
+                        CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
+                            // AES-256
+                            if v.len() != 32 {
+                                return Err(ServerConfigError::InvalidUserKeyLength(method, 32, v.len()));
+                            }
+                        }
+                        _ => unreachable!("{} doesn't support EIH", method),
+                    }
                     identity_keys.push(Bytes::from(v));
                 }
                 Err(err) => {
-                    panic!("iPSK {ipsk} is not base64 encoded, error: {err}");
+                    return Err(ServerConfigError::InvalidUserKeyEncoding(method, err));
                 }
             }
         }
 
         identity_keys.reverse();
 
-        return (upsk.to_owned(), enc_key, identity_keys);
+        return Ok((upsk.to_owned(), enc_key, identity_keys));
     }
 
     let mut enc_key = vec![0u8; method.key_len()].into_boxed_slice();
-    make_derived_key(method, &password, &mut enc_key);
+    make_derived_key(method, &password, &mut enc_key)?;
 
-    (password, enc_key, Vec::new())
+    Ok((password, enc_key, Vec::new()))
 }
 
 impl ServerConfig {
     /// Create a new `ServerConfig`
-    pub fn new<A, P>(addr: A, password: P, method: CipherKind) -> ServerConfig
+    pub fn new<A, P>(addr: A, password: P, method: CipherKind) -> Result<Self, ServerConfigError>
     where
         A: Into<ServerAddr>,
         P: Into<String>,
     {
-        let (password, enc_key, identity_keys) = password_to_keys(method, password);
+        let (password, enc_key, identity_keys) = password_to_keys(method, password)?;
 
-        ServerConfig {
+        Ok(Self {
             addr: addr.into(),
             password,
             method,
@@ -452,21 +600,24 @@ impl ServerConfig {
             id: None,
             mode: Mode::TcpAndUdp, // Server serves TCP & UDP by default
             weight: ServerWeight::new(),
-        }
+            source: ServerSource::Default,
+        })
     }
 
     /// Set encryption method
-    pub fn set_method<P>(&mut self, method: CipherKind, password: P)
+    pub fn set_method<P>(&mut self, method: CipherKind, password: P) -> Result<(), ServerConfigError>
     where
         P: Into<String>,
     {
         self.method = method;
 
-        let (password, enc_key, identity_keys) = password_to_keys(method, password);
+        let (password, enc_key, identity_keys) = password_to_keys(method, password)?;
 
         self.password = password;
         self.enc_key = enc_key;
         self.identity_keys = Arc::new(identity_keys);
+
+        Ok(())
     }
 
     /// Set plugin
@@ -492,9 +643,24 @@ impl ServerConfig {
         self.enc_key.as_ref()
     }
 
-    /// Get password
+    /// Get password (uPSK only; does not include identity keys)
     pub fn password(&self) -> &str {
         self.password.as_str()
+    }
+
+    /// Get the full password as it should appear in a config file or URL.
+    ///
+    /// For AEAD-2022 EIH configs this reconstructs `iPSK1:...:iPSKn:uPSK`.
+    /// For all other configs this is identical to [`password()`](Self::password).
+    pub fn export_password(&self) -> String {
+        if self.identity_keys.is_empty() {
+            return self.password.clone();
+        }
+        let mut parts: Vec<String> = self.identity_keys.iter()
+            .map(|k| USER_KEY_BASE64_ENGINE.encode(k))
+            .collect();
+        parts.push(self.password.clone());
+        parts.join(":")
     }
 
     /// Get identity keys (Client)
@@ -544,20 +710,20 @@ impl ServerConfig {
 
     /// Get server's TCP external address
     pub fn tcp_external_addr(&self) -> &ServerAddr {
-        if let Some(plugin) = self.plugin() {
-            if plugin.plugin_mode.enable_tcp() {
-                return self.plugin_addr.as_ref().unwrap_or(&self.addr);
-            }
+        if let Some(plugin) = self.plugin()
+            && plugin.plugin_mode.enable_tcp()
+        {
+            return self.plugin_addr.as_ref().unwrap_or(&self.addr);
         }
         &self.addr
     }
 
     /// Get server's UDP external address
     pub fn udp_external_addr(&self) -> &ServerAddr {
-        if let Some(plugin) = self.plugin() {
-            if plugin.plugin_mode.enable_udp() {
-                return self.plugin_addr.as_ref().unwrap_or(&self.addr);
-            }
+        if let Some(plugin) = self.plugin()
+            && plugin.plugin_mode.enable_udp()
+        {
+            return self.plugin_addr.as_ref().unwrap_or(&self.addr);
         }
         &self.addr
     }
@@ -618,6 +784,16 @@ impl ServerConfig {
         self.weight = weight;
     }
 
+    /// Get server's source
+    pub fn source(&self) -> ServerSource {
+        self.source
+    }
+
+    /// Set server's source
+    pub fn set_source(&mut self, source: ServerSource) {
+        self.source = source;
+    }
+
     /// Get URL for QRCode
     /// ```plain
     /// ss:// + base64(method:password@host:port)
@@ -633,9 +809,10 @@ impl ServerConfig {
             if #[cfg(feature = "aead-cipher-2022")] {
                 let user_info = if !self.method().is_aead_2022() {
                     let user_info = format!("{}:{}", self.method(), self.password());
-                    URL_PASSWORD_BASE64_ENGINE.encode(&user_info)
+                    URL_PASSWORD_BASE64_ENGINE.encode(user_info)
                 } else {
-                    format!("{}:{}", self.method(), percent_encoding::utf8_percent_encode(self.password(), percent_encoding::NON_ALPHANUMERIC))
+                    let pwd = self.export_password();
+                    format!("{}:{}", self.method(), percent_encoding::utf8_percent_encode(&pwd, percent_encoding::NON_ALPHANUMERIC))
                 };
             } else {
                 let mut user_info = format!("{}:{}", self.method(), self.password());
@@ -673,7 +850,7 @@ impl ServerConfig {
     ///
     /// 1. QRCode URL supported by shadowsocks-android, https://github.com/shadowsocks/shadowsocks-android/issues/51
     /// 2. Plain userinfo:password format supported by go2-shadowsocks2
-    pub fn from_url(encoded: &str) -> Result<ServerConfig, UrlParseError> {
+    pub fn from_url(encoded: &str) -> Result<Self, UrlParseError> {
         let parsed = Url::parse(encoded).map_err(UrlParseError::from)?;
 
         if parsed.scheme() != "ss" {
@@ -702,7 +879,7 @@ impl ServerConfig {
 
             decoded_body.insert_str(0, "ss://");
             // Parse it like ss://method:password@host:port
-            return ServerConfig::from_url(&decoded_body);
+            return Self::from_url(&decoded_body);
         }
 
         let (method, pwd) = match parsed.password() {
@@ -781,8 +958,14 @@ impl ServerConfig {
             }
         };
 
-        let method = method.parse().expect("method");
-        let mut svrconfig = ServerConfig::new(addr, pwd, method);
+        let method = match method.parse::<CipherKind>() {
+            Ok(m) => m,
+            Err(err) => {
+                error!("failed to parse \"{}\" to CipherKind, err: {:?}", method, err);
+                return Err(UrlParseError::InvalidMethod);
+            }
+        };
+        let mut svrconfig = Self::new(addr, pwd, method)?;
 
         if let Some(q) = parsed.query() {
             let query = match serde_urlencoded::from_bytes::<Vec<(String, String)>>(q.as_bytes()) {
@@ -815,7 +998,10 @@ impl ServerConfig {
         }
 
         if let Some(frag) = parsed.fragment() {
-            svrconfig.set_remarks(frag);
+            match percent_encoding::percent_decode_str(frag).decode_utf8() {
+                Ok(m) => svrconfig.set_remarks(m),
+                Err(..) => svrconfig.set_remarks(frag),
+            }
         }
 
         Ok(svrconfig)
@@ -828,56 +1014,33 @@ impl ServerConfig {
 }
 
 /// Shadowsocks URL parsing Error
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Error)]
 pub enum UrlParseError {
-    ParseError(url::ParseError),
+    #[error("{0}")]
+    ParseError(#[from] url::ParseError),
+    #[error("URL must have \"ss://\" scheme")]
     InvalidScheme,
+    #[error("unknown encryption method")]
+    InvalidMethod,
+    #[error("invalid user info")]
     InvalidUserInfo,
+    #[error("missing host")]
     MissingHost,
+    #[error("invalid authentication info")]
     InvalidAuthInfo,
+    #[error("invalid server address")]
     InvalidServerAddr,
+    #[error("invalid query string")]
     InvalidQueryString,
-}
-
-impl From<url::ParseError> for UrlParseError {
-    fn from(err: url::ParseError) -> UrlParseError {
-        UrlParseError::ParseError(err)
-    }
-}
-
-impl fmt::Display for UrlParseError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            UrlParseError::ParseError(ref err) => fmt::Display::fmt(err, f),
-            UrlParseError::InvalidScheme => write!(f, "URL must have \"ss://\" scheme"),
-            UrlParseError::InvalidUserInfo => write!(f, "invalid user info"),
-            UrlParseError::MissingHost => write!(f, "missing host"),
-            UrlParseError::InvalidAuthInfo => write!(f, "invalid authentication info"),
-            UrlParseError::InvalidServerAddr => write!(f, "invalid server address"),
-            UrlParseError::InvalidQueryString => write!(f, "invalid query string"),
-        }
-    }
-}
-
-impl error::Error for UrlParseError {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match *self {
-            UrlParseError::ParseError(ref err) => Some(err as &dyn error::Error),
-            UrlParseError::InvalidScheme => None,
-            UrlParseError::InvalidUserInfo => None,
-            UrlParseError::MissingHost => None,
-            UrlParseError::InvalidAuthInfo => None,
-            UrlParseError::InvalidServerAddr => None,
-            UrlParseError::InvalidQueryString => None,
-        }
-    }
+    #[error("{0}")]
+    ServerConfigError(#[from] ServerConfigError),
 }
 
 impl FromStr for ServerConfig {
     type Err = UrlParseError;
 
-    fn from_str(s: &str) -> Result<ServerConfig, Self::Err> {
-        ServerConfig::from_url(s)
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_url(s)
     }
 }
 
@@ -894,16 +1057,16 @@ impl ServerAddr {
     /// Get string representation of domain
     pub fn host(&self) -> String {
         match *self {
-            ServerAddr::SocketAddr(ref s) => s.ip().to_string(),
-            ServerAddr::DomainName(ref dm, _) => dm.clone(),
+            Self::SocketAddr(ref s) => s.ip().to_string(),
+            Self::DomainName(ref dm, _) => dm.clone(),
         }
     }
 
     /// Get port
     pub fn port(&self) -> u16 {
         match *self {
-            ServerAddr::SocketAddr(ref s) => s.port(),
-            ServerAddr::DomainName(_, p) => p,
+            Self::SocketAddr(ref s) => s.port(),
+            Self::DomainName(_, p) => p,
         }
     }
 }
@@ -921,9 +1084,9 @@ impl Display for ServerAddrError {
 impl FromStr for ServerAddr {
     type Err = ServerAddrError;
 
-    fn from_str(s: &str) -> Result<ServerAddr, ServerAddrError> {
+    fn from_str(s: &str) -> Result<Self, ServerAddrError> {
         match s.parse::<SocketAddr>() {
-            Ok(addr) => Ok(ServerAddr::SocketAddr(addr)),
+            Ok(addr) => Ok(Self::SocketAddr(addr)),
             Err(..) => {
                 let mut sp = s.split(':');
                 match (sp.next(), sp.next()) {
@@ -932,7 +1095,7 @@ impl FromStr for ServerAddr {
                             return Err(ServerAddrError);
                         }
                         match port.parse::<u16>() {
-                            Ok(port) => Ok(ServerAddr::DomainName(dn.to_owned(), port)),
+                            Ok(port) => Ok(Self::DomainName(dn.to_owned(), port)),
                             Err(..) => Err(ServerAddrError),
                         }
                     }
@@ -946,56 +1109,124 @@ impl FromStr for ServerAddr {
 impl Display for ServerAddr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            ServerAddr::SocketAddr(ref a) => write!(f, "{a}"),
-            ServerAddr::DomainName(ref d, port) => write!(f, "{d}:{port}"),
+            Self::SocketAddr(ref a) => write!(f, "{a}"),
+            Self::DomainName(ref d, port) => write!(f, "{d}:{port}"),
         }
     }
 }
 
+struct ServerAddrVisitor;
+
+impl serde::de::Visitor<'_> for ServerAddrVisitor {
+    type Value = ServerAddr;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("ServerAddr")
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match v.parse::<ServerAddr>() {
+            Ok(m) => Ok(m),
+            Err(_) => Err(serde::de::Error::invalid_value(serde::de::Unexpected::Str(v), &self)),
+        }
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str::<E>(v.as_str())
+    }
+
+    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match str::from_utf8(v) {
+            Ok(v) => self.visit_str(v),
+            Err(_) => Err(serde::de::Error::invalid_value(serde::de::Unexpected::Bytes(v), &self)),
+        }
+    }
+
+    fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match String::from_utf8(v) {
+            Ok(v) => self.visit_string(v),
+            Err(e) => Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Bytes(&e.into_bytes()),
+                &self,
+            )),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ServerAddr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_string(ServerAddrVisitor)
+    }
+}
+
+impl serde::Serialize for ServerAddr {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.to_string().as_str())
+    }
+}
+
 impl From<SocketAddr> for ServerAddr {
-    fn from(addr: SocketAddr) -> ServerAddr {
-        ServerAddr::SocketAddr(addr)
+    fn from(addr: SocketAddr) -> Self {
+        Self::SocketAddr(addr)
     }
 }
 
 impl<I: Into<String>> From<(I, u16)> for ServerAddr {
-    fn from((dname, port): (I, u16)) -> ServerAddr {
-        ServerAddr::DomainName(dname.into(), port)
+    fn from((dname, port): (I, u16)) -> Self {
+        Self::DomainName(dname.into(), port)
     }
 }
 
 impl From<Address> for ServerAddr {
-    fn from(addr: Address) -> ServerAddr {
+    fn from(addr: Address) -> Self {
         match addr {
-            Address::SocketAddress(sa) => ServerAddr::SocketAddr(sa),
-            Address::DomainNameAddress(dn, port) => ServerAddr::DomainName(dn, port),
+            Address::SocketAddress(sa) => Self::SocketAddr(sa),
+            Address::DomainNameAddress(dn, port) => Self::DomainName(dn, port),
         }
     }
 }
 
 impl From<&Address> for ServerAddr {
-    fn from(addr: &Address) -> ServerAddr {
+    fn from(addr: &Address) -> Self {
         match *addr {
-            Address::SocketAddress(sa) => ServerAddr::SocketAddr(sa),
-            Address::DomainNameAddress(ref dn, port) => ServerAddr::DomainName(dn.clone(), port),
+            Address::SocketAddress(sa) => Self::SocketAddr(sa),
+            Address::DomainNameAddress(ref dn, port) => Self::DomainName(dn.clone(), port),
         }
     }
 }
 
 impl From<ServerAddr> for Address {
-    fn from(addr: ServerAddr) -> Address {
+    fn from(addr: ServerAddr) -> Self {
         match addr {
-            ServerAddr::SocketAddr(sa) => Address::SocketAddress(sa),
-            ServerAddr::DomainName(dn, port) => Address::DomainNameAddress(dn, port),
+            ServerAddr::SocketAddr(sa) => Self::SocketAddress(sa),
+            ServerAddr::DomainName(dn, port) => Self::DomainNameAddress(dn, port),
         }
     }
 }
 
 impl From<&ServerAddr> for Address {
-    fn from(addr: &ServerAddr) -> Address {
+    fn from(addr: &ServerAddr) -> Self {
         match *addr {
-            ServerAddr::SocketAddr(sa) => Address::SocketAddress(sa),
-            ServerAddr::DomainName(ref dn, port) => Address::DomainNameAddress(dn.clone(), port),
+            ServerAddr::SocketAddr(sa) => Self::SocketAddress(sa),
+            ServerAddr::DomainName(ref dn, port) => Self::DomainNameAddress(dn.clone(), port),
         }
     }
 }
@@ -1025,19 +1256,19 @@ impl Display for ManagerAddrError {
 impl FromStr for ManagerAddr {
     type Err = ManagerAddrError;
 
-    fn from_str(s: &str) -> Result<ManagerAddr, ManagerAddrError> {
+    fn from_str(s: &str) -> Result<Self, ManagerAddrError> {
         match s.find(':') {
             Some(pos) => {
                 // Contains a ':' in address, must be IP:Port or Domain:Port
                 match s.parse::<SocketAddr>() {
-                    Ok(saddr) => Ok(ManagerAddr::SocketAddr(saddr)),
+                    Ok(saddr) => Ok(Self::SocketAddr(saddr)),
                     Err(..) => {
                         // Splits into Domain and Port
                         let (sdomain, sport) = s.split_at(pos);
                         let (sdomain, sport) = (sdomain.trim(), sport[1..].trim());
 
                         match sport.parse::<u16>() {
-                            Ok(port) => Ok(ManagerAddr::DomainName(sdomain.to_owned(), port)),
+                            Ok(port) => Ok(Self::DomainName(sdomain.to_owned(), port)),
                             Err(..) => Err(ManagerAddrError),
                         }
                     }
@@ -1046,7 +1277,7 @@ impl FromStr for ManagerAddr {
             #[cfg(unix)]
             None => {
                 // Must be a unix socket path
-                Ok(ManagerAddr::UnixSocketAddr(PathBuf::from(s)))
+                Ok(Self::UnixSocketAddr(PathBuf::from(s)))
             }
             #[cfg(not(unix))]
             None => Err(ManagerAddrError),
@@ -1057,36 +1288,104 @@ impl FromStr for ManagerAddr {
 impl Display for ManagerAddr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            ManagerAddr::SocketAddr(ref saddr) => fmt::Display::fmt(saddr, f),
-            ManagerAddr::DomainName(ref dname, port) => write!(f, "{dname}:{port}"),
+            Self::SocketAddr(ref saddr) => fmt::Display::fmt(saddr, f),
+            Self::DomainName(ref dname, port) => write!(f, "{dname}:{port}"),
             #[cfg(unix)]
-            ManagerAddr::UnixSocketAddr(ref path) => fmt::Display::fmt(&path.display(), f),
+            Self::UnixSocketAddr(ref path) => fmt::Display::fmt(&path.display(), f),
         }
     }
 }
 
+struct ManagerAddrVisitor;
+
+impl serde::de::Visitor<'_> for ManagerAddrVisitor {
+    type Value = ManagerAddr;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("ManagerAddr")
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match v.parse::<ManagerAddr>() {
+            Ok(m) => Ok(m),
+            Err(_) => Err(serde::de::Error::invalid_value(serde::de::Unexpected::Str(v), &self)),
+        }
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_str::<E>(v.as_str())
+    }
+
+    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match str::from_utf8(v) {
+            Ok(v) => self.visit_str(v),
+            Err(_) => Err(serde::de::Error::invalid_value(serde::de::Unexpected::Bytes(v), &self)),
+        }
+    }
+
+    fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match String::from_utf8(v) {
+            Ok(v) => self.visit_string(v),
+            Err(e) => Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Bytes(&e.into_bytes()),
+                &self,
+            )),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ManagerAddr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_string(ManagerAddrVisitor)
+    }
+}
+
+impl serde::Serialize for ManagerAddr {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.to_string().as_str())
+    }
+}
+
 impl From<SocketAddr> for ManagerAddr {
-    fn from(addr: SocketAddr) -> ManagerAddr {
-        ManagerAddr::SocketAddr(addr)
+    fn from(addr: SocketAddr) -> Self {
+        Self::SocketAddr(addr)
     }
 }
 
 impl<'a> From<(&'a str, u16)> for ManagerAddr {
-    fn from((dname, port): (&'a str, u16)) -> ManagerAddr {
-        ManagerAddr::DomainName(dname.to_owned(), port)
+    fn from((dname, port): (&'a str, u16)) -> Self {
+        Self::DomainName(dname.to_owned(), port)
     }
 }
 
 impl From<(String, u16)> for ManagerAddr {
-    fn from((dname, port): (String, u16)) -> ManagerAddr {
-        ManagerAddr::DomainName(dname, port)
+    fn from((dname, port): (String, u16)) -> Self {
+        Self::DomainName(dname, port)
     }
 }
 
 #[cfg(unix)]
 impl From<PathBuf> for ManagerAddr {
-    fn from(p: PathBuf) -> ManagerAddr {
-        ManagerAddr::UnixSocketAddr(p)
+    fn from(p: PathBuf) -> Self {
+        Self::UnixSocketAddr(p)
     }
 }
 
@@ -1111,10 +1410,10 @@ pub enum ReplayAttackPolicy {
 impl Display for ReplayAttackPolicy {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            ReplayAttackPolicy::Default => f.write_str("default"),
-            ReplayAttackPolicy::Ignore => f.write_str("ignore"),
-            ReplayAttackPolicy::Detect => f.write_str("detect"),
-            ReplayAttackPolicy::Reject => f.write_str("reject"),
+            Self::Default => f.write_str("default"),
+            Self::Ignore => f.write_str("ignore"),
+            Self::Detect => f.write_str("detect"),
+            Self::Reject => f.write_str("reject"),
         }
     }
 }
@@ -1134,11 +1433,51 @@ impl FromStr for ReplayAttackPolicy {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "default" => Ok(ReplayAttackPolicy::Default),
-            "ignore" => Ok(ReplayAttackPolicy::Ignore),
-            "detect" => Ok(ReplayAttackPolicy::Detect),
-            "reject" => Ok(ReplayAttackPolicy::Reject),
+            "default" => Ok(Self::Default),
+            "ignore" => Ok(Self::Ignore),
+            "detect" => Ok(Self::Detect),
+            "reject" => Ok(Self::Reject),
             _ => Err(ReplayAttackPolicyError),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_server_config_from_url() {
+        let server_config = ServerConfig::from_url("ss://foo:bar@127.0.0.1:9999");
+        assert!(matches!(server_config, Err(UrlParseError::InvalidMethod)));
+    }
+
+    #[cfg(feature = "aead-cipher-2022")]
+    #[test]
+    fn test_aead2022_eih_url_roundtrip() {
+        // 32-byte keys encoded in standard base64
+        let server_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; // 32 zero bytes
+        let user_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="; // 32 one-bytes
+        let password = format!("{server_key}:{user_key}");
+
+        let svr = ServerConfig::new(
+            "127.0.0.1:8388".parse::<ServerAddr>().unwrap(),
+            password.clone(),
+            CipherKind::AEAD2022_BLAKE3_AES_256_GCM,
+        )
+        .unwrap();
+
+        // identity_keys must be populated with the server key
+        assert_eq!(svr.identity_keys().len(), 1);
+
+        // to_url must round-trip: decoding the generated URL must reproduce the original password
+        let url = svr.to_url();
+        let svr2 = ServerConfig::from_url(&url).unwrap();
+
+        assert_eq!(svr2.method(), CipherKind::AEAD2022_BLAKE3_AES_256_GCM);
+        assert_eq!(svr2.addr(), svr.addr());
+        assert_eq!(svr2.identity_keys().len(), 1);
+        assert_eq!(svr2.identity_keys(), svr.identity_keys());
+        assert_eq!(svr2.key(), svr.key());
     }
 }

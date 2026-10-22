@@ -3,14 +3,14 @@
 #[cfg(unix)]
 use std::path::Path;
 use std::{
-    collections::{hash_map::Entry, HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     future::Future,
     io,
     net::SocketAddr,
     time::Duration,
 };
 
-use hickory_resolver::proto::{error::ProtoError, op::Message};
+use hickory_resolver::proto::op::Message;
 use log::{debug, trace};
 use tokio::sync::Mutex;
 
@@ -18,7 +18,7 @@ use shadowsocks::{config::ServerConfig, net::ConnectOpts, relay::socks5::Address
 
 use crate::local::context::ServiceContext;
 
-use super::upstream::DnsClient;
+use super::upstream::{DnsClient, DnsClientResult};
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
 enum DnsClientKey {
@@ -36,8 +36,8 @@ pub struct DnsClientCache {
 }
 
 impl DnsClientCache {
-    pub fn new(max_client_per_addr: usize) -> DnsClientCache {
-        DnsClientCache {
+    pub fn new(max_client_per_addr: usize) -> Self {
+        Self {
             cache: Mutex::new(HashMap::new()),
             timeout: Duration::from_secs(5),
             retry_count: 1,
@@ -51,7 +51,7 @@ impl DnsClientCache {
         msg: Message,
         connect_opts: &ConnectOpts,
         is_udp: bool,
-    ) -> Result<Message, ProtoError> {
+    ) -> DnsClientResult<Message> {
         let key = match is_udp {
             true => DnsClientKey::UdpLocal(ns),
             false => DnsClientKey::TcpLocal(ns),
@@ -66,7 +66,7 @@ impl DnsClientCache {
         ns: &Address,
         msg: Message,
         is_udp: bool,
-    ) -> Result<Message, ProtoError> {
+    ) -> DnsClientResult<Message> {
         let key = match is_udp {
             true => DnsClientKey::UdpRemote(ns.clone()),
             false => DnsClientKey::TcpRemote(ns.clone()),
@@ -75,7 +75,7 @@ impl DnsClientCache {
     }
 
     #[cfg(unix)]
-    pub async fn lookup_unix_stream<P: AsRef<Path>>(&self, ns: &P, msg: Message) -> Result<Message, ProtoError> {
+    pub async fn lookup_unix_stream<P: AsRef<Path>>(&self, ns: &P, msg: Message) -> DnsClientResult<Message> {
         let mut last_err = None;
 
         for _ in 0..self.retry_count {
@@ -113,39 +113,48 @@ impl DnsClientCache {
         connect_opts: Option<&ConnectOpts>,
         context: Option<&ServiceContext>,
         svr_cfg: Option<&ServerConfig>,
-    ) -> Result<Message, ProtoError> {
+    ) -> DnsClientResult<Message> {
         let mut last_err = None;
-        let mut dns_res: io::Result<DnsClient>;
         for _ in 0..self.retry_count {
-            match dck {
-                DnsClientKey::TcpLocal(tcp_l) => {
-                    dns_res = DnsClient::connect_tcp_local(*tcp_l, connect_opts.unwrap()).await;
+            let create_fn = async {
+                match dck {
+                    DnsClientKey::TcpLocal(tcp_l) => {
+                        let connect_opts = connect_opts.expect("connect options is required for local DNS");
+                        DnsClient::connect_tcp_local(*tcp_l, connect_opts).await
+                    }
+                    DnsClientKey::UdpLocal(udp_l) => {
+                        let connect_opts = connect_opts.expect("connect options is required for local DNS");
+                        DnsClient::connect_udp_local(*udp_l, connect_opts).await
+                    }
+                    DnsClientKey::TcpRemote(tcp_l) => {
+                        let context = context.expect("context is required for remote DNS");
+                        let svr_cfg = svr_cfg.expect("server config is required for remote DNS");
+
+                        DnsClient::connect_tcp_remote(
+                            context.context(),
+                            svr_cfg,
+                            tcp_l,
+                            context.connect_opts_ref(),
+                            context.flow_stat(),
+                        )
+                        .await
+                    }
+                    DnsClientKey::UdpRemote(udp_l) => {
+                        let context = context.expect("context is required for remote DNS");
+                        let svr_cfg = svr_cfg.expect("server config is required for remote DNS");
+
+                        DnsClient::connect_udp_remote(
+                            context.context(),
+                            svr_cfg,
+                            udp_l.clone(),
+                            context.connect_opts_ref(),
+                            context.flow_stat(),
+                        )
+                        .await
+                    }
                 }
-                DnsClientKey::UdpLocal(udp_l) => {
-                    dns_res = DnsClient::connect_udp_local(*udp_l, connect_opts.unwrap()).await;
-                }
-                DnsClientKey::TcpRemote(tcp_l) => {
-                    dns_res = DnsClient::connect_tcp_remote(
-                        context.unwrap().context(),
-                        svr_cfg.unwrap(),
-                        tcp_l,
-                        context.unwrap().connect_opts_ref(),
-                        context.unwrap().flow_stat(),
-                    )
-                    .await;
-                }
-                DnsClientKey::UdpRemote(udp_l) => {
-                    dns_res = DnsClient::connect_udp_remote(
-                        context.unwrap().context(),
-                        svr_cfg.unwrap(),
-                        udp_l.clone(),
-                        context.unwrap().connect_opts_ref(),
-                        context.unwrap().flow_stat(),
-                    )
-                    .await;
-                }
-            }
-            match self.get_client_or_create(dck, async { dns_res }).await {
+            };
+            match self.get_client_or_create(dck, create_fn).await {
                 Ok(mut client) => match client.lookup_timeout(msg.clone(), self.timeout).await {
                     Ok(msg) => {
                         self.save_client(dck.clone(), client).await;

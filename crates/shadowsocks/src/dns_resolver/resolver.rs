@@ -4,14 +4,13 @@
 use std::sync::Arc;
 use std::{
     fmt::{self, Debug},
-    io::{self, Error, ErrorKind},
+    io::{self, Error},
     net::SocketAddr,
     time::Instant,
 };
 
 #[cfg(feature = "hickory-dns")]
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
 use cfg_if::cfg_if;
 #[cfg(feature = "hickory-dns")]
 use hickory_resolver::config::ResolverConfig;
@@ -19,7 +18,7 @@ use hickory_resolver::config::ResolverConfig;
 use hickory_resolver::config::ResolverOpts;
 #[cfg(all(feature = "hickory-dns", unix, not(target_os = "android")))]
 use log::error;
-use log::{log_enabled, trace, Level};
+use log::{Level, log_enabled, trace};
 use tokio::net::lookup_host;
 #[cfg(all(feature = "hickory-dns", unix, not(target_os = "android")))]
 use tokio::task::JoinHandle;
@@ -31,18 +30,24 @@ use crate::net::ConnectOpts;
 use super::hickory_dns_resolver::DnsResolver as HickoryDnsResolver;
 
 /// Abstract DNS resolver
-#[async_trait]
+#[trait_variant::make(Send)]
+#[dynosaur::dynosaur(DynDnsResolve = dyn(box) DnsResolve, bridge(dyn))]
 pub trait DnsResolve {
     /// Resolves `addr:port` to a list of `SocketAddr`
     async fn resolve(&self, addr: &str, port: u16) -> io::Result<Vec<SocketAddr>>;
 }
 
+// Equivalent to (dyn DnsResolve + Send + Sync)
+unsafe impl Send for DynDnsResolve<'_> {}
+unsafe impl Sync for DynDnsResolve<'_> {}
+
 #[cfg(feature = "hickory-dns")]
+#[derive(Debug)]
 pub struct HickoryDnsSystemResolver {
     resolver: ArcSwap<HickoryDnsResolver>,
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg_attr(any(windows, target_os = "android"), allow(dead_code))]
     connect_opts: ConnectOpts,
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg_attr(any(windows, target_os = "android"), allow(dead_code))]
     opts: Option<ResolverOpts>,
 }
 
@@ -62,24 +67,24 @@ pub enum DnsResolver {
     #[cfg(feature = "hickory-dns")]
     HickoryDns(HickoryDnsResolver),
     /// Customized Resolver
-    Custom(Box<dyn DnsResolve + Send + Sync>),
+    Custom(Box<DynDnsResolve<'static>>),
 }
 
 impl Default for DnsResolver {
-    fn default() -> DnsResolver {
-        DnsResolver::system_resolver()
+    fn default() -> Self {
+        Self::system_resolver()
     }
 }
 
 impl Debug for DnsResolver {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            DnsResolver::System => f.write_str("System"),
+            Self::System => f.write_str("System"),
             #[cfg(feature = "hickory-dns")]
-            DnsResolver::HickoryDnsSystem { .. } => f.write_str("HickoryDnsSystem(..)"),
+            Self::HickoryDnsSystem { .. } => f.write_str("HickoryDnsSystem(..)"),
             #[cfg(feature = "hickory-dns")]
-            DnsResolver::HickoryDns(..) => f.write_str("HickoryDns(..)"),
-            DnsResolver::Custom(..) => f.write_str("Custom(..)"),
+            Self::HickoryDns(..) => f.write_str("HickoryDns(..)"),
+            Self::Custom(..) => f.write_str("Custom(..)"),
         }
     }
 }
@@ -88,7 +93,7 @@ impl Debug for DnsResolver {
 impl Drop for DnsResolver {
     fn drop(&mut self) {
         #[cfg(all(feature = "hickory-dns", unix, not(target_os = "android")))]
-        if let DnsResolver::HickoryDnsSystem { ref abortable, .. } = *self {
+        if let Self::HickoryDnsSystem { ref abortable, .. } = *self {
             abortable.abort();
         }
     }
@@ -115,10 +120,10 @@ cfg_if! {
 
             fn next(&mut self) -> Option<SocketAddr> {
                 match *self {
-                    EitherResolved::Tokio(ref mut a) => a.next(),
-                    EitherResolved::HickoryDnsSystem(ref mut b) => b.next(),
-                    EitherResolved::HickoryDns(ref mut c) => c.next(),
-                    EitherResolved::Custom(ref mut d) => d.next(),
+                    Self::Tokio(ref mut a) => a.next(),
+                    Self::HickoryDnsSystem(ref mut b) => b.next(),
+                    Self::HickoryDns(ref mut c) => c.next(),
+                    Self::Custom(ref mut d) => d.next(),
                 }
             }
         }
@@ -156,7 +161,7 @@ async fn hickory_dns_notify_update_dns(resolver: Arc<HickoryDnsSystemResolver>) 
 
     use super::hickory_dns_resolver::create_resolver;
 
-    static DNS_RESOLV_FILE_PATH: &str = "/etc/resolv.conf";
+    const DNS_RESOLV_FILE_PATH: &str = "/etc/resolv.conf";
 
     if !Path::new(DNS_RESOLV_FILE_PATH).exists() {
         trace!("resolv file {DNS_RESOLV_FILE_PATH} doesn't exist");
@@ -223,8 +228,8 @@ async fn hickory_dns_notify_update_dns(resolver: Arc<HickoryDnsSystemResolver>) 
 
 impl DnsResolver {
     /// Use system DNS resolver. Tokio will call `getaddrinfo` in blocking pool.
-    pub fn system_resolver() -> DnsResolver {
-        DnsResolver::System
+    pub fn system_resolver() -> Self {
+        Self::System
     }
 
     /// Use hickory-dns DNS system resolver (with DNS cache)
@@ -234,7 +239,7 @@ impl DnsResolver {
     pub async fn hickory_dns_system_resolver(
         opts: Option<ResolverOpts>,
         connect_opts: ConnectOpts,
-    ) -> io::Result<DnsResolver> {
+    ) -> io::Result<Self> {
         use super::hickory_dns_resolver::create_resolver;
 
         let resolver = create_resolver(None, opts.clone(), connect_opts.clone()).await?;
@@ -256,7 +261,7 @@ impl DnsResolver {
                     })
                 };
 
-                Ok(DnsResolver::HickoryDnsSystem { inner, abortable })
+                Ok(Self::HickoryDnsSystem { inner, abortable })
             } else {
                 Ok(DnsResolver::HickoryDnsSystem { inner })
             }
@@ -269,24 +274,25 @@ impl DnsResolver {
         dns: ResolverConfig,
         opts: Option<ResolverOpts>,
         connect_opts: ConnectOpts,
-    ) -> io::Result<DnsResolver> {
+    ) -> io::Result<Self> {
         use super::hickory_dns_resolver::create_resolver;
-        Ok(DnsResolver::HickoryDns(
-            create_resolver(Some(dns), opts, connect_opts).await?,
-        ))
+        Ok(Self::HickoryDns(create_resolver(Some(dns), opts, connect_opts).await?))
     }
 
     /// Custom DNS resolver
-    pub fn custom_resolver<R>(custom: R) -> DnsResolver
+    pub fn custom_resolver<R>(custom: R) -> Self
     where
         R: DnsResolve + Send + Sync + 'static,
     {
-        DnsResolver::Custom(Box::new(custom) as Box<dyn DnsResolve + Send + Sync>)
+        Self::Custom(DynDnsResolve::new_box(custom))
     }
 
     /// Resolve address into `SocketAddr`s
-    #[allow(clippy::needless_lifetimes)]
-    pub async fn resolve<'a>(&self, addr: &'a str, port: u16) -> io::Result<impl Iterator<Item = SocketAddr> + 'a> {
+    pub async fn resolve<'a>(
+        &self,
+        addr: &'a str,
+        port: u16,
+    ) -> io::Result<impl Iterator<Item = SocketAddr> + 'a + use<'a>> {
         struct ResolverLogger<'x, 'y> {
             resolver: &'x DnsResolver,
             addr: &'y str,
@@ -295,7 +301,7 @@ impl DnsResolver {
         }
 
         impl<'x, 'y> ResolverLogger<'x, 'y> {
-            fn new(resolver: &'x DnsResolver, addr: &'y str, port: u16) -> ResolverLogger<'x, 'y> {
+            fn new(resolver: &'x DnsResolver, addr: &'y str, port: u16) -> Self {
                 let start_time = if log_enabled!(Level::Trace) {
                     Some(Instant::now())
                 } else {
@@ -311,7 +317,7 @@ impl DnsResolver {
             }
         }
 
-        impl<'x, 'y> Drop for ResolverLogger<'x, 'y> {
+        impl Drop for ResolverLogger<'_, '_> {
             fn drop(&mut self) {
                 match self.start_time {
                     Some(start_time) => {
@@ -365,37 +371,41 @@ impl DnsResolver {
         let _log_guard = ResolverLogger::new(self, addr, port);
 
         match *self {
-            DnsResolver::System => match lookup_host((addr, port)).await {
+            Self::System => match lookup_host((addr, port)).await {
                 Ok(v) => Ok(EitherResolved::Tokio(v)),
                 Err(err) => {
-                    let err = Error::new(ErrorKind::Other, format!("dns resolve {addr}:{port} error: {err}"));
+                    let err = Error::other(format!("dns resolve {addr}:{port} error: {err}"));
                     Err(err)
                 }
             },
             #[cfg(feature = "hickory-dns")]
-            DnsResolver::HickoryDnsSystem { ref inner, .. } => match inner.resolver.load().lookup_ip(addr).await {
-                Ok(lookup_result) => Ok(EitherResolved::HickoryDnsSystem(
-                    lookup_result.into_iter().map(move |ip| SocketAddr::new(ip, port)),
-                )),
+            Self::HickoryDnsSystem { ref inner, .. } => match inner.resolver.load().lookup_ip(addr).await {
+                Ok(lookup_result) => {
+                    let result: Vec<SocketAddr> =
+                        lookup_result.iter().map(move |ip| SocketAddr::new(ip, port)).collect();
+                    Ok(EitherResolved::HickoryDnsSystem(result.into_iter()))
+                }
                 Err(err) => {
-                    let err = Error::new(ErrorKind::Other, format!("dns resolve {addr}:{port} error: {err}"));
+                    let err = Error::other(format!("dns resolve {addr}:{port} error: {err}"));
                     Err(err)
                 }
             },
             #[cfg(feature = "hickory-dns")]
-            DnsResolver::HickoryDns(ref resolver) => match resolver.lookup_ip(addr).await {
-                Ok(lookup_result) => Ok(EitherResolved::HickoryDns(
-                    lookup_result.into_iter().map(move |ip| SocketAddr::new(ip, port)),
-                )),
+            Self::HickoryDns(ref resolver) => match resolver.lookup_ip(addr).await {
+                Ok(lookup_result) => {
+                    let result: Vec<SocketAddr> =
+                        lookup_result.iter().map(move |ip| SocketAddr::new(ip, port)).collect();
+                    Ok(EitherResolved::HickoryDns(result.into_iter()))
+                }
                 Err(err) => {
-                    let err = Error::new(ErrorKind::Other, format!("dns resolve {addr}:{port} error: {err}"));
+                    let err = Error::other(format!("dns resolve {addr}:{port} error: {err}"));
                     Err(err)
                 }
             },
-            DnsResolver::Custom(ref resolver) => match resolver.resolve(addr, port).await {
+            Self::Custom(ref resolver) => match resolver.resolve(addr, port).await {
                 Ok(v) => Ok(EitherResolved::Custom(v.into_iter())),
                 Err(err) => {
-                    let err = Error::new(ErrorKind::Other, format!("dns resolve {addr}:{port} error: {err}"));
+                    let err = Error::other(format!("dns resolve {addr}:{port} error: {err}"));
                     Err(err)
                 }
             },
@@ -404,6 +414,6 @@ impl DnsResolver {
 
     /// Check if currently using system resolver
     pub fn is_system_resolver(&self) -> bool {
-        matches!(*self, DnsResolver::System)
+        matches!(*self, Self::System)
     }
 }

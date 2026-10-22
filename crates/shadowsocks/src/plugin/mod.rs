@@ -27,6 +27,8 @@ use crate::config::{Mode, ServerAddr};
 mod obfs_proxy;
 mod ss_plugin;
 
+const PLUGIN_START_CHECK_INTERVAL: Duration = Duration::from_millis(20);
+
 /// Config for plugin
 #[derive(Debug, Clone)]
 pub struct PluginConfig {
@@ -58,6 +60,7 @@ pub enum PluginMode {
 }
 
 /// A shadowsocks SIP004 Plugin
+#[derive(Debug)]
 pub struct Plugin {
     process: Child,
     local_addr: SocketAddr,
@@ -69,7 +72,7 @@ impl Plugin {
     ///
     /// `PluginMode::Client`: Plugin listens to `local_addr` and send data to `remote_addr`, client should send data to `local_addr`
     /// `PluginMode::Server`: Plugin listens to `remote_addr` and send data to `local_addr`, server should listen to `local_addr`
-    pub fn start(c: &PluginConfig, remote_addr: &ServerAddr, mode: PluginMode) -> io::Result<Plugin> {
+    pub fn start(c: &PluginConfig, remote_addr: &ServerAddr, mode: PluginMode) -> io::Result<Self> {
         let loop_ip = match remote_addr {
             ServerAddr::SocketAddr(sa) => match sa.ip() {
                 IpAddr::V4(..) => Ipv4Addr::LOCALHOST.into(),
@@ -112,7 +115,7 @@ impl Plugin {
                     }
                 }
 
-                Ok(Plugin {
+                Ok(Self {
                     process,
                     local_addr,
                     mode: c.plugin_mode,
@@ -146,14 +149,21 @@ impl Plugin {
             let remain_time = timeout - elapsed_time;
 
             match time::timeout(remain_time, TcpStream::connect(self.local_addr)).await {
-                Ok(Ok(..)) => {
-                    return true;
+                Ok(Ok(stream)) => {
+                    // The plugin listens on a port in the ephemeral range. If it is not listening yet,
+                    // connect() may pick the same port as source and connect to itself (TCP simultaneous open).
+                    if stream.local_addr().ok() != Some(self.local_addr) {
+                        return true;
+                    }
                 }
                 Ok(Err(..)) => {}
                 Err(..) => {
                     return false;
                 }
             }
+
+            // Don't spin on connect(), each attempt allocates an ephemeral port
+            time::sleep(PLUGIN_START_CHECK_INTERVAL).await;
         }
     }
 

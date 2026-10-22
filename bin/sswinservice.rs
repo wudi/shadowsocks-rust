@@ -1,14 +1,16 @@
 use std::{
     ffi::OsString,
     future::Future,
-    process::ExitCode,
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
 
 use clap::Command;
 use log::{error, info};
-use shadowsocks_rust::service::{local, manager, server};
+use shadowsocks_rust::{
+    error::ShadowsocksResult,
+    service::{local, manager, server},
+};
 use tokio::{runtime::Runtime, sync::oneshot};
 use windows_service::{
     define_windows_service,
@@ -19,7 +21,7 @@ use windows_service::{
 
 const SERVICE_NAME: &str = "ssservice";
 const SERVICE_EXIT_CODE_ARGUMENT_ERROR: u32 = 100;
-const SERVICE_EXIT_CODE_EXITED_UNEXPECTLY: u32 = 101;
+const SERVICE_EXIT_CODE_EXITED_UNEXPECTEDLY: u32 = 101;
 const SERVICE_EXIT_CODE_CREATE_FAILED: u32 = 102;
 
 #[inline]
@@ -53,11 +55,11 @@ fn set_service_status(
 
 fn handle_create_service_result<F>(
     status_handle: ServiceStatusHandle,
-    create_service_result: Result<(Runtime, F), ExitCode>,
+    create_service_result: ShadowsocksResult<(Runtime, F)>,
     stop_receiver: oneshot::Receiver<()>,
 ) -> Result<(), windows_service::Error>
 where
-    F: Future<Output = ExitCode>,
+    F: Future<Output = ShadowsocksResult>,
 {
     match create_service_result {
         Ok((runtime, main_fut)) => {
@@ -82,7 +84,7 @@ where
                             break true;
                         }
                         exit_code = main_fut => {
-                            info!("service exited unexpectly with code: {:?}", exit_code);
+                            info!("service exited unexpectedly with code: {:?}", exit_code);
                             break false;
                         }
                     }
@@ -96,13 +98,13 @@ where
                 if exited_by_ctrl {
                     ServiceExitCode::Win32(0)
                 } else {
-                    ServiceExitCode::ServiceSpecific(SERVICE_EXIT_CODE_EXITED_UNEXPECTLY)
+                    ServiceExitCode::ServiceSpecific(SERVICE_EXIT_CODE_EXITED_UNEXPECTEDLY)
                 },
                 Duration::default(),
             )?;
         }
-        Err(exit_code) => {
-            error!("failed to create service, exit code: {:?}", exit_code);
+        Err(err) => {
+            error!("failed to create service, exit code: {:?}", err.exit_code());
 
             // Report running state
             set_service_status(

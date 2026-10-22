@@ -57,10 +57,8 @@ use std::{
 };
 
 use aes::{
-    cipher::{BlockDecrypt, BlockEncrypt, KeyInit},
-    Aes128,
-    Aes256,
-    Block,
+    Aes128, Aes256, Block,
+    cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit},
 };
 use byte_string::ByteStr;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -70,11 +68,11 @@ use lru_time_cache::LruCache;
 #[cfg(feature = "aead-cipher-2022-extra")]
 use crate::crypto::v2::udp::ChaCha8Poly1305Cipher;
 use crate::{
-    config::{method_support_eih, ServerUser, ServerUserManager},
+    config::{ServerUser, ServerUserManager, method_support_eih},
     context::Context,
     crypto::{
-        v2::udp::{ChaCha20Poly1305Cipher, UdpCipher},
         CipherKind,
+        v2::udp::{ChaCha20Poly1305Cipher, UdpCipher},
     },
     relay::{
         get_aead_2022_padding_size,
@@ -101,7 +99,7 @@ pub enum ProtocolError {
     InvalidClientUser(Bytes),
     #[error("invalid socket type, expecting {0:#x}, but found {1:#x}")]
     InvalidSocketType(u8, u8),
-    #[error("invalid timestamp {0} - now {1} = {}", *.0 as i64 - *.1 as i64)]
+    #[error("invalid timestamp {0} - now {1} = {ts_diff}", ts_diff = *.0 as i64 - *.1 as i64)]
     InvalidTimestamp(u64, u64),
     #[error(transparent)]
     IoError(#[from] io::Error),
@@ -118,13 +116,13 @@ struct CipherKey {
 }
 
 impl PartialOrd for CipherKey {
-    fn partial_cmp(&self, other: &CipherKey) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for CipherKey {
-    fn cmp(&self, other: &CipherKey) -> Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         let hash1 = {
             let mut hasher = DefaultHasher::new();
             self.hash(&mut hasher);
@@ -227,12 +225,14 @@ fn encrypt_message(
             match method {
                 CipherKind::AEAD2022_BLAKE3_AES_128_GCM => {
                     let cipher = Aes128::new_from_slice(ipsk).expect("AES-128 init");
-                    let block = Block::from_mut_slice(packet_header);
+                    let block = <&mut Block as TryFrom<&mut [u8]>>::try_from(packet_header)
+                        .expect("Packet header length mismatch");
                     cipher.encrypt_block(block);
                 }
                 CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
                     let cipher = Aes256::new_from_slice(ipsk).expect("AES-256 init");
-                    let block = Block::from_mut_slice(packet_header);
+                    let block = <&mut Block as TryFrom<&mut [u8]>>::try_from(packet_header)
+                        .expect("Packet header length mismatch");
                     cipher.encrypt_block(block);
                 }
                 _ => unreachable!("{} is not an AES-*-GCM cipher", method),
@@ -307,12 +307,14 @@ fn decrypt_message(
             match method {
                 CipherKind::AEAD2022_BLAKE3_AES_128_GCM => {
                     let cipher = Aes128::new_from_slice(key).expect("AES-128 init");
-                    let block = Block::from_mut_slice(packet_header);
+                    let block = <&mut Block as TryFrom<&mut [u8]>>::try_from(packet_header)
+                        .expect("Packet header length mismatch");
                     cipher.decrypt_block(block);
                 }
                 CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
                     let cipher = Aes256::new_from_slice(key).expect("AES-256 init");
-                    let block = Block::from_mut_slice(packet_header);
+                    let block = <&mut Block as TryFrom<&mut [u8]>>::try_from(packet_header)
+                        .expect("Packet header length mismatch");
                     cipher.decrypt_block(block);
                 }
                 _ => unreachable!("{} is not an AES-*-GCM cipher", method),
@@ -345,11 +347,15 @@ fn decrypt_message(
                     match method {
                         CipherKind::AEAD2022_BLAKE3_AES_128_GCM => {
                             let cipher = Aes128::new_from_slice(key).expect("AES-128 init");
-                            cipher.decrypt_block(Block::from_mut_slice(eih));
+                            cipher.decrypt_block(
+                                <&mut Block as TryFrom<&mut [u8]>>::try_from(eih).expect("EIH key length mismatch"),
+                            );
                         }
                         CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
                             let cipher = Aes256::new_from_slice(key).expect("AES-256 init");
-                            cipher.decrypt_block(Block::from_mut_slice(eih))
+                            cipher.decrypt_block(
+                                <&mut Block as TryFrom<&mut [u8]>>::try_from(eih).expect("EIH key length mismatch"),
+                            )
                         }
                         _ => unreachable!("{} doesn't support EIH", method),
                     }
@@ -468,11 +474,15 @@ pub fn encrypt_client_payload_aead_2022(
             match method {
                 CipherKind::AEAD2022_BLAKE3_AES_128_GCM => {
                     let cipher = Aes128::new_from_slice(ipsk).expect("AES-128 init");
-                    cipher.encrypt_block(Block::from_mut_slice(identity_header));
+                    cipher.encrypt_block(
+                        <&mut Block as TryFrom<&mut [u8]>>::try_from(identity_header).expect("EIH key length mismatch"),
+                    );
                 }
                 CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
                     let cipher = Aes256::new_from_slice(ipsk).expect("AES-256 init");
-                    cipher.encrypt_block(Block::from_mut_slice(identity_header));
+                    cipher.encrypt_block(
+                        <&mut Block as TryFrom<&mut [u8]>>::try_from(identity_header).expect("EIH key length mismatch"),
+                    );
                 }
                 _ => unreachable!("{} doesn't support EIH", method),
             }

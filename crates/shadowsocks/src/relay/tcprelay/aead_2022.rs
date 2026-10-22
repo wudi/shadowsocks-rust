@@ -8,7 +8,7 @@
 //! +--------+--------+--------+--------+--------+--------+--------+--------+--------+
 //! | ATYP   | ADDRESS ... (Variable Length ...)
 //! +--------+--------+--------+--------+--------+--------+--------+--------+--------+
-//! | PORT (BE)       | Paddding Length | Padding (Variable Length ...)
+//! | PORT (BE)       | Padding Length  | Padding (Variable Length ...)
 //! +--------+--------+--------+--------+--------+--------+--------+--------+--------+
 //!
 //! TCP Request Header (after encryption, *ciphertext*)
@@ -51,14 +51,11 @@ use std::{
     sync::Arc,
     task::{self, Poll},
     time::SystemTime,
-    u16,
 };
 
 use aes::{
-    cipher::{BlockDecrypt, BlockEncrypt, KeyInit},
-    Aes128,
-    Aes256,
-    Block,
+    Aes128, Aes256, Block,
+    cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit},
 };
 use byte_string::ByteStr;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -68,9 +65,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{crypto_io::StreamType, proxy_stream::protocol::v2::SERVER_STREAM_TIMESTAMP_MAX_DIFF};
 use crate::{
-    config::{method_support_eih, ServerUserManager},
+    config::{ServerUserManager, method_support_eih},
     context::Context,
-    crypto::{v2::tcp::TcpCipher, CipherKind},
+    crypto::{CipherKind, v2::tcp::TcpCipher},
 };
 
 #[inline]
@@ -105,7 +102,7 @@ pub enum ProtocolError {
     DecryptLengthError,
     #[error("invalid stream type, expecting {0:#x}, but found {1:#x}")]
     InvalidStreamType(u8, u8),
-    #[error("invalid timestamp {0} - now {1} = {}", *.0 as i64 - *.1 as i64)]
+    #[error("invalid timestamp {0} - now {1} = {ts_diff}", ts_diff = *.0 as i64 - *.1 as i64)]
     InvalidTimestamp(u64, u64),
 }
 
@@ -113,10 +110,10 @@ pub enum ProtocolError {
 pub type ProtocolResult<T> = Result<T, ProtocolError>;
 
 impl From<ProtocolError> for io::Error {
-    fn from(e: ProtocolError) -> io::Error {
+    fn from(e: ProtocolError) -> Self {
         match e {
             ProtocolError::IoError(err) => err,
-            _ => io::Error::new(ErrorKind::Other, e),
+            _ => Self::other(e),
         }
     }
 }
@@ -144,8 +141,8 @@ pub struct DecryptedReader {
 }
 
 impl DecryptedReader {
-    pub fn new(stream_ty: StreamType, method: CipherKind, key: &[u8]) -> DecryptedReader {
-        DecryptedReader::with_user_manager(stream_ty, method, key, None)
+    pub fn new(stream_ty: StreamType, method: CipherKind, key: &[u8]) -> Self {
+        Self::with_user_manager(stream_ty, method, key, None)
     }
 
     pub fn with_user_manager(
@@ -153,9 +150,9 @@ impl DecryptedReader {
         method: CipherKind,
         key: &[u8],
         user_manager: Option<Arc<ServerUserManager>>,
-    ) -> DecryptedReader {
+    ) -> Self {
         if method.salt_len() > 0 {
-            DecryptedReader {
+            Self {
                 stream_ty,
                 state: DecryptReadState::ReadHeader {
                     key: Bytes::copy_from_slice(key),
@@ -171,7 +168,7 @@ impl DecryptedReader {
                 has_handshaked: false,
             }
         } else {
-            DecryptedReader {
+            Self {
                 stream_ty,
                 state: DecryptReadState::ReadHeader {
                     key: Bytes::new(), // EMPTY SALT, no allocation
@@ -301,50 +298,59 @@ impl DecryptedReader {
         // Extensible Identity Header
         // https://github.com/Shadowsocks-NET/shadowsocks-specs/blob/main/2022-2-shadowsocks-2022-extensible-identity-headers.md
         let mut cipher = if require_eih {
-            if let Some(ref user_manager) = self.user_manager {
-                // Assume we have at least 1 EIH
-                if header_chunk.len() < 16 {
-                    error!("expecting EIH, but header chunk len: {}", header_chunk.len());
-                    return Err(ProtocolError::MissingExtendedIdentityHeader).into();
+            match self.user_manager {
+                Some(ref user_manager) => {
+                    // Assume we have at least 1 EIH
+                    if header_chunk.len() < 16 {
+                        error!("expecting EIH, but header chunk len: {}", header_chunk.len());
+                        return Err(ProtocolError::MissingExtendedIdentityHeader).into();
+                    }
+
+                    let (eih, remain_header_chunk) = header_chunk.split_at_mut(16);
+                    header_chunk = remain_header_chunk;
+
+                    let key_material = [key, salt].concat();
+                    let identity_sub_key = blake3::derive_key(AEAD2022_EIH_SUBKEY_CONTEXT, &key_material);
+                    let mut user_hash = Block::from([0u8; 16]);
+                    match self.method {
+                        CipherKind::AEAD2022_BLAKE3_AES_128_GCM => {
+                            let cipher = Aes128::new_from_slice(&identity_sub_key[0..16]).expect("AES-128");
+                            cipher.decrypt_block_b2b(
+                                <&Block as TryFrom<&[u8]>>::try_from(eih).expect("EIH key length mismatch"),
+                                &mut user_hash,
+                            );
+                        }
+                        CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
+                            let cipher = Aes256::new_from_slice(&identity_sub_key[0..32]).expect("AES-256");
+                            cipher.decrypt_block_b2b(
+                                <&Block as TryFrom<&[u8]>>::try_from(eih).expect("EIH key length mismatch"),
+                                &mut user_hash,
+                            );
+                        }
+                        _ => unreachable!("{} doesn't support EIH", self.method),
+                    }
+
+                    let user_hash = user_hash.as_slice();
+                    trace!(
+                        "server EIH {:?}, hash: {:?}",
+                        ByteStr::new(eih),
+                        ByteStr::new(user_hash)
+                    );
+
+                    match user_manager.get_user_by_hash(user_hash) {
+                        None => {
+                            return Err(ProtocolError::InvalidClientUser(Bytes::copy_from_slice(user_hash))).into();
+                        }
+                        Some(user) => {
+                            trace!("{:?} chosen by EIH", user);
+                            self.user_key = Some(Bytes::copy_from_slice(user.key()));
+                            TcpCipher::new(self.method, user.key(), salt)
+                        }
+                    }
                 }
-
-                let (eih, remain_header_chunk) = header_chunk.split_at_mut(16);
-                header_chunk = remain_header_chunk;
-
-                let key_material = [key, salt].concat();
-                let identity_sub_key = blake3::derive_key(AEAD2022_EIH_SUBKEY_CONTEXT, &key_material);
-                let mut user_hash = Block::from([0u8; 16]);
-                match self.method {
-                    CipherKind::AEAD2022_BLAKE3_AES_128_GCM => {
-                        let cipher = Aes128::new_from_slice(&identity_sub_key[0..16]).expect("AES-128");
-                        cipher.decrypt_block_b2b(Block::from_slice(eih), &mut user_hash);
-                    }
-                    CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
-                        let cipher = Aes256::new_from_slice(&identity_sub_key[0..32]).expect("AES-256");
-                        cipher.decrypt_block_b2b(Block::from_slice(eih), &mut user_hash);
-                    }
-                    _ => unreachable!("{} doesn't support EIH", self.method),
+                _ => {
+                    unreachable!("user_manager must not be None")
                 }
-
-                let user_hash = user_hash.as_slice();
-                trace!(
-                    "server EIH {:?}, hash: {:?}",
-                    ByteStr::new(eih),
-                    ByteStr::new(user_hash)
-                );
-
-                match user_manager.get_user_by_hash(user_hash) {
-                    None => {
-                        return Err(ProtocolError::InvalidClientUser(Bytes::copy_from_slice(user_hash))).into();
-                    }
-                    Some(user) => {
-                        trace!("{:?} chosen by EIH", user);
-                        self.user_key = Some(Bytes::copy_from_slice(user.key()));
-                        TcpCipher::new(self.method, user.key(), salt)
-                    }
-                }
-            } else {
-                unreachable!("user_manager must not be None")
             }
         } else {
             TcpCipher::new(self.method, key, salt)
@@ -419,7 +425,7 @@ impl DecryptedReader {
         let cipher = self.cipher.as_mut().expect("cipher is None");
 
         let m = &mut self.buffer[..length_len];
-        let length = DecryptedReader::decrypt_length(cipher, m)?;
+        let length = Self::decrypt_length(cipher, m)?;
 
         Ok(Some(length)).into()
     }
@@ -515,7 +521,12 @@ impl DecryptedReader {
 enum EncryptWriteState {
     AssembleHeader,
     AssemblePacket,
-    Writing { pos: usize },
+    /// `plain_len` records the length of the plaintext buffer that was assembled into the
+    /// pending ciphertext frame. It must be reported back to the caller when the frame is
+    /// fully sent, because the caller is allowed to retry `poll_write_encrypted` with a
+    /// longer buffer after `Poll::Pending` (e.g. tokio's `copy` appending freshly read data).
+    /// Only the bytes counted by `plain_len` were actually consumed.
+    Writing { pos: usize, plain_len: usize },
 }
 
 /// Writer wrapper that will encrypt data automatically
@@ -531,9 +542,9 @@ pub struct EncryptedWriter {
 
 impl EncryptedWriter {
     /// Creates a new EncryptedWriter
-    pub fn new(stream_ty: StreamType, method: CipherKind, key: &[u8], nonce: &[u8]) -> EncryptedWriter {
-        static EMPTY_IDENTITY: [Bytes; 0] = [];
-        EncryptedWriter::with_identity(stream_ty, method, key, nonce, &EMPTY_IDENTITY)
+    pub fn new(stream_ty: StreamType, method: CipherKind, key: &[u8], nonce: &[u8]) -> Self {
+        const EMPTY_IDENTITY: [Bytes; 0] = [];
+        Self::with_identity(stream_ty, method, key, nonce, &EMPTY_IDENTITY)
     }
 
     /// Creates a new EncryptedWriter with identities
@@ -543,7 +554,7 @@ impl EncryptedWriter {
         key: &[u8],
         nonce: &[u8],
         identity_keys: &[Bytes],
-    ) -> EncryptedWriter {
+    ) -> Self {
         // nonce should be sent with the first packet
         let mut buffer = BytesMut::with_capacity(nonce.len() + identity_keys.len() * 16);
         buffer.put(nonce);
@@ -560,7 +571,8 @@ impl EncryptedWriter {
                     let enc_key = &sub_key[0..16];
                     let cipher = Aes128::new_from_slice(enc_key).expect("AES-128");
 
-                    let ipsk_plain_text = Block::from_slice(ipsk_plain_text);
+                    let ipsk_plain_text =
+                        <&Block as TryFrom<&[u8]>>::try_from(ipsk_plain_text).expect("ipsk length mismatch");
                     let mut block = Block::from([0u8; 16]);
                     cipher.encrypt_block_b2b(ipsk_plain_text, &mut block);
 
@@ -575,7 +587,8 @@ impl EncryptedWriter {
                     let enc_key = &sub_key[0..32];
                     let cipher = Aes256::new_from_slice(enc_key).expect("AES-256");
 
-                    let ipsk_plain_text = Block::from_slice(ipsk_plain_text);
+                    let ipsk_plain_text =
+                        <&Block as TryFrom<&[u8]>>::try_from(ipsk_plain_text).expect("ipsk length mismatch");
                     let mut block = Block::from([0u8; 16]);
                     cipher.encrypt_block_b2b(ipsk_plain_text, &mut block);
 
@@ -607,7 +620,7 @@ impl EncryptedWriter {
             }
         }
 
-        EncryptedWriter {
+        Self {
             stream_ty,
             cipher: TcpCipher::new(method, key, nonce),
             method,
@@ -687,7 +700,10 @@ impl EncryptedWriter {
                     unsafe { self.buffer.advance_mut(self.cipher.tag_len()) };
 
                     // Step 3. Write all
-                    self.state = EncryptWriteState::Writing { pos: 0 };
+                    self.state = EncryptWriteState::Writing {
+                        pos: 0,
+                        plain_len: buf.len(),
+                    };
                 }
 
                 EncryptWriteState::AssemblePacket => {
@@ -714,9 +730,12 @@ impl EncryptedWriter {
                     unsafe { self.buffer.advance_mut(self.cipher.tag_len()) };
 
                     // Step 3. Write all
-                    self.state = EncryptWriteState::Writing { pos: 0 };
+                    self.state = EncryptWriteState::Writing {
+                        pos: 0,
+                        plain_len: buf.len(),
+                    };
                 }
-                EncryptWriteState::Writing { ref mut pos } => {
+                EncryptWriteState::Writing { ref mut pos, plain_len } => {
                     while *pos < self.buffer.len() {
                         let n = ready!(Pin::new(&mut *stream).poll_write(cx, &self.buffer[*pos..]))?;
                         if n == 0 {
@@ -729,9 +748,141 @@ impl EncryptedWriter {
                     self.state = EncryptWriteState::AssemblePacket;
                     self.buffer.clear();
 
-                    return Ok(buf.len()).into();
+                    // Only the plaintext bytes that were assembled into this frame have been sent.
+                    // The caller may retry with a longer buffer after `Poll::Pending`, and those
+                    // extra bytes have NOT been encrypted into this frame yet.
+                    return Ok(plain_len).into();
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context as TaskContext, Poll as TaskPoll, Waker},
+    };
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    use super::*;
+    use crate::config::ServerType;
+
+    /// An `AsyncWrite` sink that can be blocked to simulate backpressure,
+    /// replayable as an `AsyncRead` source for verifying the round-trip.
+    struct TestStream {
+        blocked: bool,
+        bytes: Vec<u8>,
+        read_pos: usize,
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            data: &[u8],
+        ) -> TaskPoll<io::Result<usize>> {
+            if self.blocked {
+                return TaskPoll::Pending;
+            }
+            self.bytes.extend_from_slice(data);
+            TaskPoll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> TaskPoll<io::Result<()>> {
+            TaskPoll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> TaskPoll<io::Result<()>> {
+            TaskPoll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> TaskPoll<io::Result<()>> {
+            if self.read_pos < self.bytes.len() {
+                let remaining = &self.bytes[self.read_pos..];
+                let n = remaining.len().min(buf.remaining());
+                buf.put_slice(&remaining[..n]);
+                self.read_pos += n;
+            }
+            TaskPoll::Ready(Ok(()))
+        }
+    }
+
+    // Regression test for https://github.com/shadowsocks/shadowsocks-rust/issues/2175
+    //
+    // The writer must report the plaintext length that was actually encrypted into the
+    // pending frame, instead of the length of the buffer passed on the retried call.
+    // Otherwise, bytes appended by the caller while the writer was `Poll::Pending`
+    // (as tokio's `copy` does) would be silently dropped.
+    #[test]
+    fn test_retry_after_pending_with_longer_buffer() {
+        let context = Context::new_shared(ServerType::Server);
+
+        let key = [0x42u8; 16];
+        let nonce = [0x24u8; 16];
+        let method = CipherKind::AEAD2022_BLAKE3_AES_128_GCM;
+
+        let mut writer = EncryptedWriter::new(StreamType::Client, method, &key, &nonce);
+
+        let mut stream = TestStream {
+            blocked: true,
+            bytes: Vec::new(),
+            read_pos: 0,
+        };
+
+        let mut cx = TaskContext::from_waker(Waker::noop());
+
+        // 1st attempt: the underlying stream is blocked, so the writer must return Pending.
+        assert!(
+            writer
+                .poll_write_encrypted(&mut cx, &mut stream, b"a")
+                .is_pending()
+        );
+
+        // The underlying stream becomes writable.
+        stream.blocked = false;
+
+        // 2nd attempt: the caller retries with a longer buffer, like tokio's
+        // `copy`/`copy_bidirectional` appending freshly read data while waiting.
+        // Only "a" was encrypted into the pending frame, so only 1 byte may be reported.
+        match writer.poll_write_encrypted(&mut cx, &mut stream, b"ab") {
+            TaskPoll::Ready(Ok(n)) => assert_eq!(n, 1),
+            v => panic!("unexpected result: {v:?}"),
+        }
+
+        // The caller advances by the reported length and submits the remaining bytes.
+        match writer.poll_write_encrypted(&mut cx, &mut stream, b"b") {
+            TaskPoll::Ready(Ok(n)) => assert_eq!(n, 1),
+            v => panic!("unexpected result: {v:?}"),
+        }
+
+        // Round-trip: everything reported as written must decrypt back to the original bytes.
+        let mut reader = DecryptedReader::new(StreamType::Server, method, &key);
+        let mut output = Vec::new();
+        loop {
+            let mut buffer = [0u8; 16];
+            let mut read_buf = ReadBuf::new(&mut buffer);
+            match reader.poll_read_decrypted(&mut cx, &context, &mut stream, &mut read_buf) {
+                TaskPoll::Ready(Ok(())) => {
+                    if read_buf.filled().is_empty() {
+                        // EOF
+                        break;
+                    }
+                    output.extend_from_slice(read_buf.filled());
+                }
+                v => panic!("unexpected read result: {v:?}"),
+            }
+        }
+
+        assert_eq!(output, b"ab");
     }
 }

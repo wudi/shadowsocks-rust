@@ -2,17 +2,19 @@
 
 [![License](https://img.shields.io/github/license/zonyitoo/shadowsocks-rust.svg)](https://github.com/zonyitoo/shadowsocks-rust)
 [![Build & Test](https://github.com/shadowsocks/shadowsocks-rust/actions/workflows/build-and-test.yml/badge.svg)](https://github.com/shadowsocks/shadowsocks-rust/actions/workflows/build-and-test.yml)
-[![Build Releases](https://github.com/shadowsocks/shadowsocks-rust/actions/workflows/build-release.yml/badge.svg)](https://github.com/shadowsocks/shadowsocks-rust/actions/workflows/build-release.yml)
+[![Build MSRV](https://github.com/shadowsocks/shadowsocks-rust/actions/workflows/build-msrv.yml/badge.svg)](https://github.com/shadowsocks/shadowsocks-rust/actions/workflows/build-msrv.yml)
+[![Build Releases](https://github.com/shadowsocks/shadowsocks-rust/actions/workflows/build-release.yml/badge.svg?event=push)](https://github.com/shadowsocks/shadowsocks-rust/actions/workflows/build-release.yml)
 [![Build Nightly Releases](https://github.com/shadowsocks/shadowsocks-rust/actions/workflows/build-nightly-release.yml/badge.svg)](https://github.com/shadowsocks/shadowsocks-rust/actions/workflows/build-nightly-release.yml)
+[![Gurubase](https://img.shields.io/badge/Gurubase-Ask%20shadowsocks%20Guru-006BFF)](https://gurubase.io/g/shadowsocks)
 
 [![crates.io](https://img.shields.io/crates/v/shadowsocks-rust.svg)](https://crates.io/crates/shadowsocks-rust)
 [![Release](https://img.shields.io/github/release/shadowsocks/shadowsocks-rust.svg)](https://github.com/shadowsocks/shadowsocks-rust/releases)
-[![archlinuxcn shadowsocks-rust-git](https://img.shields.io/badge/dynamic/json?label=archlinuxcn-git&query=%24.version&url=https%3A%2F%2Fbuild.archlinuxcn.org%2Fapi%2Fv2%2Fpackages%2Fshadowsocks-rust-git)](https://build.archlinuxcn.org/)
-[![archlinuxcn shadowsocks-rust-opt-git](https://img.shields.io/badge/dynamic/json?label=archlinuxcn-opt-git&query=%24.version&url=https%3A%2F%2Fbuild.archlinuxcn.org%2Fapi%2Fv2%2Fpackages%2Fshadowsocks-rust-opt-git)](https://build.archlinuxcn.org/)
-[![aur shadowsocks-rust](https://img.shields.io/aur/version/shadowsocks-rust)](https://aur.archlinux.org/packages/shadowsocks-rust)
-[![NixOS](https://img.shields.io/badge/NixOS-shadowsocks--rust-blue?logo=nixos)](https://github.com/NixOS/nixpkgs/tree/master/pkgs/tools/networking/shadowsocks-rust)
-
-[![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-black.svg)](https://snapcraft.io/shadowsocks-rust)
+[![shadowsocks-rust](https://img.shields.io/archlinux/v/extra/x86_64/shadowsocks-rust)](https://archlinux.org/packages/extra/x86_64/shadowsocks-rust/)
+[![aur shadowsocks-rust-git](https://img.shields.io/aur/version/shadowsocks-rust-git)](https://aur.archlinux.org/packages/shadowsocks-rust-git)
+[![NixOS](https://img.shields.io/badge/NixOS-shadowsocks--rust-blue?logo=nixos)](https://github.com/NixOS/nixpkgs/blob/master/pkgs/by-name/sh/shadowsocks-rust/package.nix)
+[![snap shadowsocks-rust](https://snapcraft.io/shadowsocks-rust/badge.svg)](https://snapcraft.io/shadowsocks-rust)
+[![homebrew shadowsocks-rust](https://img.shields.io/homebrew/v/shadowsocks-rust)](https://formulae.brew.sh/formula/shadowsocks-rust#default)
+[![MacPorts shadowsocks-rust](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fports.macports.org%2Fapi%2Fv1%2Fports%2Fshadowsocks-rust%2F&query=%24.version&label=macports)](https://ports.macports.org/port/shadowsocks-rust/)
 
 This is a port of [shadowsocks](https://github.com/shadowsocks/shadowsocks).
 
@@ -50,7 +52,11 @@ Related Projects:
 
 - `local-dns` - Allow using dns protocol for `sslocal`, serves as a DNS server proxying queries to local or remote DNS servers by ACL rules
 
+- `local-fake-dns` - FakeDNS, allocating an IP address for each individual Query from a specific IP pool
+
 - `local-tun` - [TUN](https://en.wikipedia.org/wiki/TUN/TAP) interface support for `sslocal`
+
+- `local-online-config` - [SIP008](https://shadowsocks.org/doc/sip008.html) Online Configuration Delivery
 
 - `stream-cipher` - Enable deprecated stream ciphers. WARN: stream ciphers are UNSAFE!
 
@@ -119,13 +125,15 @@ systemctl restart snap.shadowsocks-rust.sslocal-daemon.service
 systemctl status snap.shadowsocks-rust.sslocal-daemon.service
 ```
 
+Default configuration file path probably is `/var/snap/shadowsocks-rust/common/etc/shadowsocks-rust/config.json`.
+
 ### **Download release**
 
 Download static-linked build [here](https://github.com/shadowsocks/shadowsocks-rust/releases).
 
-- `build-windows`: Build for `x86_64-pc-windows-msvc`
-- `build-linux`: Build for `x86_64-unknown-linux-gnu`, Debian 9 (Stretch), GLIBC 2.18
-- `build-docker`: Build for `x86_64-unknown-linux-musl`, `x86_64-pc-windows-gnu`, ... (statically linked)
+- Most of them are built with [cross](https://github.com/cross-rs/cross). Build environment details could be found in its README, such as glibc's version.
+- `x86_64-apple-darwin`, `aarch64-apple-darwin` are built in github's `macos-latest` image. Information could be found in [here](https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners).
+- `x86_64-pc-windows-msvc` is built in github's `windows-latest` image. Information could be found in [here](https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners).
 
 ### **Docker**
 
@@ -264,12 +272,18 @@ Requirements:
 ./build/build-release
 ```
 
-Then `sslocal`, `ssserver`, `ssmanager` and `ssurl` will be packaged in
+Then `sslocal`, `ssserver`, `ssmanager`, `ssservice` and `ssurl` will be packaged in
 
 - `./build/shadowsocks-${VERSION}-stable.x86_64-unknown-linux-musl.tar.xz`
 - `./build/shadowsocks-${VERSION}-stable.x86_64-pc-windows-gnu.zip`
 
 Read `Cargo.toml` for more details.
+
+For Linux with low GLIBC versions, set `CROSS_CONFIG` to CentOS based image:
+
+```bash
+export CROSS_CONFIG=Cross-centos.toml
+```
 
 ## Getting Started
 
@@ -294,7 +308,9 @@ Create a ShadowSocks' configuration file. Example
 }
 ```
 
-Detailed explanation could be found in [shadowsocks' documentation](https://github.com/shadowsocks/shadowsocks/wiki).
+Detailed explanation of the configuration file could be found in [shadowsocks' documentation](https://github.com/shadowsocks/shadowsocks/wiki). (Link to original project, not maintained anymore !)
+
+> :warning: For snap installations, configuration file is most probably located in `/var/snap/shadowsocks-rust/common/etc/shadowsocks-rust/config.json` (see <https://github.com/shadowsocks/shadowsocks-rust/issues/621> / <https://github.com/shadowsocks/shadowsocks-rust/issues/1146>)
 
 In shadowsocks-rust, we also have an extended configuration file format, which is able to define more than one server. You can also disable individual servers.
 
@@ -356,6 +372,24 @@ Start local client with configuration file
 sslocal -c /path/to/shadowsocks.json
 ```
 
+`sslocal` also supports routing its outbound TCP connection to the Shadowsocks server through a proxy or proxy chain with the `outbound_proxy` config key. Supported hop types are `socks5://`, `http://`, and `https://`, with optional `user:pass@` credentials. This option is currently available through the configuration file for `sslocal`; `ssserver` supports both the config file and repeated `--outbound-proxy` command line flags.
+
+```jsonc
+{
+    "server": "server.example.com",
+    "server_port": 8388,
+    "password": "hello-kitty",
+    "method": "aes-256-gcm",
+    "local_address": "127.0.0.1",
+    "local_port": 1080,
+    "outbound_proxy": [
+        "socks5://user:pass@127.0.0.1:1080",
+        "https://proxy.example.com:443",
+        "http://127.0.0.1:1081"
+    ]
+}
+```
+
 ### Socks5 Local client
 
 ```bash
@@ -400,6 +434,40 @@ Redirects connections with `iptables` configurations to the port that `sslocal` 
 - `--protocol redir` enables local client Redir mode
 - (optional) `--tcp-redir` sets TCP mode to `REDIRECT` (Linux)
 - (optional) `--udp-redir` sets UDP mode to `TPROXY` (Linux)
+
+#### Linux iptables example
+
+`iptables` transparent redirection must point to a `redir` listener. Do not redirect traffic to a `socks` or `http`
+listener, because `REDIRECT`/`TPROXY` sends the original TCP/UDP flow without a SOCKS handshake or HTTP `CONNECT`
+request. Use `--protocol socks` or `--protocol http` only for applications that can speak those proxy protocols
+directly.
+
+For a minimal TCP-only setup on the local machine:
+
+```bash
+# Start sslocal in redir mode. The fwmark lets iptables skip sslocal's own
+# outbound connection to the Shadowsocks server and avoid a proxy loop.
+sudo sslocal -b "127.0.0.1:60080" --protocol redir \
+    -s "server.example.com:8388" -m "aes-256-gcm" -k "hello-kitty" \
+    --tcp-redir "redirect" --outbound-fwmark 255
+
+# Redirect locally generated TCP connections to sslocal.
+sudo iptables -t nat -N shadowsocks-redir
+for addr in 0/8 10/8 100.64/10 127/8 169.254/16 172.16/12 192.168/16 224/4 240/4; do
+    sudo iptables -t nat -A shadowsocks-redir -d "$addr" -j RETURN
+done
+sudo iptables -t nat -A shadowsocks-redir -m mark --mark 0xff/0xff -j RETURN
+sudo iptables -t nat -A shadowsocks-redir -p tcp -j REDIRECT --to-ports 60080
+sudo iptables -t nat -A OUTPUT -p tcp -j shadowsocks-redir
+```
+
+For TCP+UDP, LAN gateway, IPv6, or ipset-based routing, adapt the examples in
+[`configs/iptables_mixed.sh`](configs/iptables_mixed.sh) or [`configs/iptables_tproxy.sh`](configs/iptables_tproxy.sh)
+and run `sslocal` with `--tcp-redir "tproxy" --udp-redir "tproxy"`.
+
+If the Shadowsocks server itself must be reached through an HTTP or SOCKS proxy, combine redir mode with the
+`outbound_proxy` configuration option. This routes `sslocal`'s outbound TCP connection through that proxy; UDP traffic
+is not proxied by `outbound_proxy`.
 
 ### Tun interface client
 
@@ -472,7 +540,16 @@ ssserver -c /path/to/shadowsocks.json
 
 # Pass all parameters via command line
 ssserver -s "[::]:8388" -m "aes-256-gcm" -k "hello-kitty" --plugin "v2ray-plugin" --plugin-opts "server;tls;host=github.com"
+
+# Route outbound TCP traffic through a proxy chain
+ssserver -s "[::]:8388" -m "aes-256-gcm" -k "hello-kitty" \
+  --outbound-proxy socks5://user:pass@127.0.0.1:1080 \
+  --outbound-proxy https://proxy.example.com:443 \
+  --outbound-proxy http://127.0.0.1:1081
 ```
+
+Repeat `--outbound-proxy` in hop order. A single occurrence keeps the previous single-hop behavior.
+Supported hop types are `socks5://`, `http://`, and `https://`. The same `outbound_proxy` setting can also be used in configuration files for both `sslocal` and `ssserver`, but UDP traffic is not proxied.
 
 ### Server Manager
 
@@ -598,7 +675,10 @@ Example configuration:
             "local_address": "127.0.0.1",
             "local_port": 3128,
             // OPTIONAL. macOS launchd activate socket
-            "launchd_tcp_socket_name": "TCPListener"
+            "launchd_tcp_socket_name": "TCPListener",
+            // OPTIONAL. Authentication configuration file
+            // Configuration file document could be found in the next section.
+            "http_auth_config_path": "/path/to/auth.json",
         },
         {
             // DNS local server (feature = "local-dns")
@@ -645,6 +725,25 @@ Example configuration:
             // Linux/Android: tproxy (default)
             // FreeBSD/OpenBSD: pf (default)
             "udp_redir": "tproxy"
+        },
+        {
+            // FakeDNS local server (feature = "local-fake-dns")
+            // FakeDNS is a DNS server that allocates an IPv4 / IPv6 address in a specific pool for each queries.
+            // Subsequence requests from the other local interfaces that the target addresses includes those allocated IP addresses,
+            // will be substituted back to their original domain name addresses.
+            // This feature is useful mostly for transparent proxy, which will allow the proxied domain names to be resolved remotely.
+            "protocol": "fake-dns",
+            // Listen address
+            "local_address": "127.0.0.1",
+            "local_port": 10053,
+            // IPv4 address pool (for A records)
+            "fake_dns_ipv4_network": "10.255.0.0/16",
+            // IPv6 address pool (for AAAA records)
+            "fake_dns_ipv6_network": "fdf2:e786:ab40:9d2f::/64",
+            // Persistent storage for all allocated DNS records
+            "fake_dns_database_path": "/var/shadowsocks/fakedns.db",
+            // OPTIONAL: Record expire duration in seconds, 10s by default
+            "fake_dns_record_expire_duration": 10
         }
     ],
 
@@ -726,6 +825,39 @@ Example configuration:
             // - uPSK is the user's PSK ("password")
             // Example:
             // "password": "3SYJ/f8nmVuzKvKglykRQDSgg10e/ADilkdRWrrY9HU=:4w0GKJ9U3Ox7CIXGU4A3LDQAqP6qrp/tUi/ilpOR9p4="
+        },
+        {
+            "...": "Any other fields",
+
+            // Some optional fields for this specific server
+
+            // Outbound socket options
+            // Linux Only (SO_MARK)
+            "outbound_fwmark": 255,
+            // FreeBSD only (SO_USER_COOKIE)
+            "outbound_user_cookie": 255,
+            // `SO_BINDTODEVICE` (Linux), `IP_BOUND_IF` (BSD), `IP_UNICAST_IF` (Windows) socket option for outbound sockets
+            "outbound_bind_interface": "eth1",
+            // Outbound socket bind() to this IP (choose a specific interface)
+            "outbound_bind_addr": "11.22.33.44",
+            // Outbound UDP socket allows IP fragmentation (default false)
+            "outbound_udp_allow_fragmentation": false,
+            // Inbound UDP socket allows IP fragmentation (default false)
+            "inbound_udp_allow_fragmentation": false,
+            // Route outbound TCP connections through a proxy or proxy chain
+            // (TCP only; UDP is not proxied)
+            // Works for both sslocal and ssserver
+            // sslocal: configure in JSON; ssserver: JSON or repeated --outbound-proxy
+            // Single hop:
+            "outbound_proxy": "socks5://127.0.0.1:1080",
+            // Single hop with username/password:
+            // "outbound_proxy": "socks5://user:pass@127.0.0.1:1080",
+            // Multi-hop:
+            // "outbound_proxy": [
+            //     "socks5://user:pass@127.0.0.1:1080",
+            //     "https://proxy.example.com:443",
+            //     "http://127.0.0.1:1081"
+            // ],
         }
     ],
 
@@ -788,6 +920,22 @@ Example configuration:
     "outbound_bind_interface": "eth1",
     // Outbound socket bind() to this IP (choose a specific interface)
     "outbound_bind_addr": "11.22.33.44",
+    // Outbound UDP socket allows IP fragmentation (default false)
+    "outbound_udp_allow_fragmentation": false,
+    // Route outbound TCP connections through a proxy or proxy chain
+    // (TCP only; UDP is not proxied)
+    // Works for both sslocal and ssserver
+    // sslocal: configure in JSON; ssserver: JSON or repeated --outbound-proxy
+    // Single hop:
+    "outbound_proxy": "socks5://127.0.0.1:1080",
+    // Single hop with username/password:
+    // "outbound_proxy": "socks5://user:pass@127.0.0.1:1080",
+    // Multi-hop:
+    // "outbound_proxy": [
+    //     "socks5://user:pass@127.0.0.1:1080",
+    //     "https://proxy.example.com:443",
+    //     "http://127.0.0.1:1081"
+    // ],
 
     // Balancer customization
     "balancer": {
@@ -801,22 +949,81 @@ Example configuration:
         "check_best_interval": 5
     },
 
+    // SIP008 Online Configuration Delivery
+    // https://shadowsocks.org/doc/sip008.html
+    "online_config": {
+        "config_url": "https://path-to-online-sip008-configuration",
+        // Optional. Seconds between each update to config_url. Default to 3600s
+        "update_interval": 3600,
+        // Optional. Whitelist of plugins (RECOMMENDED for all users)
+        // SECURITY: To avoid executing untrusted commands loaded from config_url
+        "allowed_plugins": [
+            "v2ray-plugin"
+        ]
+    },
+
     // Service configurations
     // Logger configuration
     "log": {
+        // Default log level to use, if not overridden by `writers`, default is `0`
         // Equivalent to `-v` command line option
         "level": 1,
+        // Default log format to use, if not overridden by `writers`
         "format": {
-            // Euiqvalent to `--log-without-time`
+            // Euiqvalent to `--log-without-time`, default is `false`
             "without_time": false,
         },
-        // Equivalent to `--log-config`
-        // More detail could be found in https://crates.io/crates/log4rs
-        "config_path": "/path/to/log4rs/config.yaml"
+        // Advanced logging configuration for configuring multiple writers
+        // A console writer will be configured by default.
+        // Set this to empty array `[]` to disable logging completely
+        "writers": [
+            {
+                // Configure a console writer
+                // The inner fields are optional, if not set, it will use the default values
+                // To minimally configure a console writer, simply write `"console": {}`.
+                "console": {
+                    "level": 2,
+                    "format": {
+                        "without_time": false,
+                    }
+                }
+            },
+            {
+                // Configure a file writer, useful when running as a Windows Service
+                "file": {
+                    // `level` and `format` can also be set here, if not set, it will use the default values
+                    
+                    // Required. Directory to store log files
+                    "directory": "/var/log/shadowsocks-rust",
+                    // Optional. Log rotation frequency, must be one of the following:
+                    // - never (default): This will result in log file located at `directory/prefix.suffix`
+                    // - daily: A new log file in the format of `directory/prefix.yyyy-MM-dd.suffix` will be created daily
+                    // - hourly: A new log file in the format of `directory/prefix.yyyy-MM-dd-HH.suffix` will be created hourly
+                    "rotation": "never",
+                    // Optional. Prefix of log file, default is one of `sslocal`, `ssserver`, `ssmanager` depending on the service being run.
+                    "prefix": "shadowsocks-rust",
+                    // Optional. Suffix of log file, default is `log`
+                    "suffix": "log",
+                    // Optional. If set, keeps the last N log files
+                    "max_files": 5
+                }
+            },
+            {
+                // Configure a syslog writer, only supported on *nix system
+                "syslog": {
+                    // `level` and `format` can also be set here, if not set, it will use the default values
+
+                    // Optional. Set the "identity" when calling openlog(). Use current service name by default.
+                    "identity": "identity_name",
+                    // Optional. Set the "facility" when calling openlog(). 1 (user-level messages) by default. See RFC5424.
+                    "facility": 1
+                }
+            }
+        ]
     },
     // Runtime configuration
     "runtime": {
-        // single_thread or multi_thread
+        // `single_thread` or `multi_thread`
         "mode": "multi_thread",
         // Worker threads that are used in multi-thread runtime
         "worker_count": 10
@@ -832,6 +1039,24 @@ The configuration file is set by `socks5_auth_config_path` in `locals`.
 {
     // Password/Username Authentication (RFC1929)
     "password": {
+        "users": [
+            {
+                "user_name": "USERNAME in UTF-8",
+                "password": "PASSWORD in UTF-8"
+            }
+        ]
+    }
+}
+```
+
+### HTTP Authentication Configuration
+
+The configuration file is set by `http_auth_config_path` in `locals`.
+
+```jsonc
+{
+    // Basic Authentication (RFC9110)
+    "basic": {
         "users": [
             {
                 "user_name": "USERNAME in UTF-8",
@@ -892,19 +1117,22 @@ These Ciphers require `"password"` to be a Base64 string of key that have **exac
 
 - For local servers (`sslocal`, `ssredir`, ...)
   - Modes:
-    - `[bypass_all]` - ACL runs in `BlackList` mode. Bypasses all addresses that didn't match any rules.
-    - `[proxy_all]` - ACL runs in `WhiteList` mode. Proxies all addresses that didn't match any rules.
+    - `[bypass_all]` - ACL runs in `WhiteList` mode. Bypasses all addresses except those matching any rules.
+    - `[proxy_all]` - ACL runs in `BlackList` mode. Proxies all addresses except those matching any rules. (default)
   - Rules:
     - `[bypass_list]` - Rules for connecting directly
     - `[proxy_list]` - Rules for connecting through proxies
 - For remote servers (`ssserver`)
   - Modes:
-    - `[reject_all]` - ACL runs in `BlackList` mode. Rejects all clients that didn't match any rules.
-    - `[accept_all]` - ACL runs in `WhiteList` mode. Accepts all clients that didn't match any rules.
+    - `[reject_all]` - ACL runs in `WhiteList` mode. Rejects all clients except those matching any rules.
+    - `[accept_all]` - ACL runs in `BlackList` mode. Accepts all clients except those matching any rules. (default)
+    - `[outbound_block_all]` - Outbound ACL runs in `WhiteList` mode. Blocks all outbound addresses except those matching any rules.
+    - `[outbound_allow_all]` - Outbound ACL runs in `BlackList` mode. Allows all outbound addresses except those matching any rules. (default)
   - Rules:
     - `[white_list]` - Rules for accepted clients
     - `[black_list]` - Rules for rejected clients
     - `[outbound_block_list]` - Rules for blocking outbound addresses.
+    - `[outbound_allow_list]` - Rules for allowing outbound addresses.
 
 ### Example
 
@@ -942,6 +1170,22 @@ These Ciphers require `"password"` to be a Base64 string of key that have **exac
 [proxy_list]
 ||google.com
 8.8.8.8
+```
+
+### Runtime reload (Unix only)
+
+`sslocal` reloads files at runtime when it receives signals:
+
+- `SIGUSR1` - Reload the server list from the configuration file. Listeners and established connections are not affected. Requires that `sslocal` was started with a configuration file.
+- `SIGUSR2` - Reload the ACL file. The file is parsed completely before the new rules are swapped in; if parsing fails, the previous rules stay active. Established connections keep their routing decisions, and only new connections are checked against the new rules.
+
+The configuration file and the ACL file are recorded as absolute paths at startup, so reloads keep working even if the process changes its working directory afterwards (e.g. when daemonized).
+
+Both signals are no-ops on Windows. Example:
+
+```bash
+# After editing the ACL file, make sslocal apply it without a restart
+kill -USR2 $(pidof sslocal)
 ```
 
 ## Useful Tools

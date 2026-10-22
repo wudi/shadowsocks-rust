@@ -4,27 +4,82 @@ use std::{
     future::Future,
     io::{self, ErrorKind},
     net::SocketAddr,
+    pin::Pin,
     sync::Arc,
+    task::{self, Poll},
     time::Duration,
 };
 
 use log::{debug, error, info, trace, warn};
 use shadowsocks::{
+    ProxyListener, ServerConfig,
     crypto::CipherKind,
     net::{AcceptOpts, TcpStream as OutboundTcpStream},
-    relay::tcprelay::{utils::copy_encrypted_bidirectional, ProxyServerStream},
-    ProxyListener,
-    ServerConfig,
+    relay::{socks5::Address, tcprelay::{ProxyServerStream, utils::copy_encrypted_bidirectional}},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpStream as TokioTcpStream,
     time,
 };
 
-use crate::net::{utils::ignore_until_end, MonProxyStream};
+use crate::net::{MonProxyStream, OutboundProxyStream, TcpDialer, utils::ignore_until_end};
 
 use super::context::ServiceContext;
+
+/// `TcpDialer` adapter that uses the server's connect-options.
+struct ServerTcpDialer<'a> {
+    context: &'a ServiceContext,
+}
+
+impl<'a> TcpDialer for ServerTcpDialer<'a> {
+    async fn dial(&self, addr: &Address) -> io::Result<OutboundTcpStream> {
+        OutboundTcpStream::connect_remote_with_opts(self.context.context_ref(), addr, self.context.connect_opts_ref())
+            .await
+    }
+}
+
+/// Unified outbound stream: either direct or through the outbound proxy chain.
+// Not boxed: one instance per connection, boxing would add an allocation on the hot path
+#[allow(clippy::large_enum_variant)]
+enum RemoteStream {
+    Direct(OutboundTcpStream),
+    Proxied(OutboundProxyStream),
+}
+
+impl AsyncRead for RemoteStream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Direct(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Proxied(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for RemoteStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Direct(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Proxied(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Direct(s) => Pin::new(s).poll_flush(cx),
+            Self::Proxied(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Direct(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Proxied(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+impl Unpin for RemoteStream {}
 
 /// TCP server instance
 pub struct TcpServer {
@@ -38,9 +93,9 @@ impl TcpServer {
         context: Arc<ServiceContext>,
         svr_cfg: ServerConfig,
         accept_opts: AcceptOpts,
-    ) -> io::Result<TcpServer> {
+    ) -> io::Result<Self> {
         let listener = ProxyListener::bind_with_opts(context.context(), &svr_cfg, accept_opts).await?;
-        Ok(TcpServer {
+        Ok(Self {
             context,
             svr_cfg,
             listener,
@@ -163,7 +218,10 @@ impl TcpServerClient {
                     // This will also prevent the socket entering TIME_WAIT state.
 
                     let stream = self.stream.into_inner().into_inner();
-                    let _ = stream.set_linger(Some(Duration::ZERO));
+
+                    // tokio's TcpStream.set_linger was marked as deprecated.
+                    // But we set linger(0), which won't block the thread when close() the socket.
+                    let _ = socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO));
 
                     return Ok(());
                 }
@@ -180,8 +238,7 @@ impl TcpServerClient {
 
                 trace!(
                     "tcp silent-drop peer: {} is now closing with result {:?}",
-                    self.peer_addr,
-                    res
+                    self.peer_addr, res
                 );
 
                 return Ok(());
@@ -190,8 +247,7 @@ impl TcpServerClient {
 
         trace!(
             "accepted tcp client connection {}, establishing tunnel to {}",
-            self.peer_addr,
-            target_addr
+            self.peer_addr, target_addr
         );
 
         if self.context.check_outbound_blocked(&target_addr).await {
@@ -202,14 +258,26 @@ impl TcpServerClient {
             return Ok(());
         }
 
-        let mut remote_stream = match timeout_fut(
-            self.timeout,
-            OutboundTcpStream::connect_remote_with_opts(
-                self.context.context_ref(),
-                &target_addr,
-                self.context.connect_opts_ref(),
-            ),
-        )
+        let mut remote_stream = match timeout_fut(self.timeout, async {
+            match self.context.outbound_client() {
+                None => OutboundTcpStream::connect_remote_with_opts(
+                    self.context.context_ref(),
+                    &target_addr,
+                    self.context.connect_opts_ref(),
+                )
+                .await
+                .map(RemoteStream::Direct),
+                Some(client) => {
+                    let dialer = ServerTcpDialer {
+                        context: self.context.as_ref(),
+                    };
+                    client
+                        .connect_tcp(&dialer, &target_addr)
+                        .await
+                        .map(RemoteStream::Proxied)
+                }
+            }
+        })
         .await
         {
             Ok(s) => s,
@@ -245,8 +313,7 @@ impl TcpServerClient {
 
                     trace!(
                         "tcp tunnel {} -> {} sent TFO connect without data",
-                        self.peer_addr,
-                        target_addr
+                        self.peer_addr, target_addr
                     );
                 }
             }
@@ -263,18 +330,13 @@ impl TcpServerClient {
             Ok((rn, wn)) => {
                 trace!(
                     "tcp tunnel {} <-> {} closed, L2R {} bytes, R2L {} bytes",
-                    self.peer_addr,
-                    target_addr,
-                    rn,
-                    wn
+                    self.peer_addr, target_addr, rn, wn
                 );
             }
             Err(err) => {
                 trace!(
                     "tcp tunnel {} <-> {} closed with error: {}",
-                    self.peer_addr,
-                    target_addr,
-                    err
+                    self.peer_addr, target_addr, err
                 );
             }
         }

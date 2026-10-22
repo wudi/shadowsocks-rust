@@ -3,18 +3,11 @@
 use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt};
+use http_body_util::{BodyExt, combinators::BoxBody};
 use hyper::{
-    body,
+    HeaderMap, Method, Request, Response, StatusCode, Uri, Version, body,
     header::{self, HeaderValue},
     http::uri::{Authority, Scheme},
-    HeaderMap,
-    Method,
-    Request,
-    Response,
-    StatusCode,
-    Uri,
-    Version,
 };
 use log::{debug, error, trace};
 use shadowsocks::relay::Address;
@@ -28,6 +21,7 @@ use crate::local::{
 };
 
 use super::{
+    config::HttpAuthConfig,
     http_client::HttpClient,
     utils::{authority_addr, check_keep_alive, connect_host, host_addr},
 };
@@ -35,22 +29,25 @@ use super::{
 pub struct HttpService {
     context: Arc<ServiceContext>,
     peer_addr: SocketAddr,
-    http_client: HttpClient,
+    http_client: HttpClient<body::Incoming>,
     balancer: PingBalancer,
+    http_auth: Arc<HttpAuthConfig>,
 }
 
 impl HttpService {
     pub fn new(
         context: Arc<ServiceContext>,
         peer_addr: SocketAddr,
-        http_client: HttpClient,
+        http_client: HttpClient<body::Incoming>,
         balancer: PingBalancer,
-    ) -> HttpService {
-        HttpService {
+        http_auth: Arc<HttpAuthConfig>,
+    ) -> Self {
+        Self {
             context,
             peer_addr,
             http_client,
             balancer,
+            http_auth,
         }
     }
 
@@ -59,6 +56,37 @@ impl HttpService {
         mut req: Request<body::Incoming>,
     ) -> hyper::Result<Response<BoxBody<Bytes, hyper::Error>>> {
         trace!("request {} {:?}", self.peer_addr, req);
+
+        if self.http_auth.auth_required() {
+            // Only support Basic authentication for now
+            match req.headers().get(header::PROXY_AUTHORIZATION) {
+                Some(header_value) => {
+                    if let Ok(header_str) = header_value.to_str() {
+                        if !self.http_auth.verify_basic_auth(header_str) {
+                            error!(
+                                "HTTP {} URI {} invalid proxy-authorization: {}",
+                                req.method(),
+                                req.uri(),
+                                header_str
+                            );
+                            return make_proxy_authentication_required();
+                        }
+                    } else {
+                        error!(
+                            "HTTP {} URI {} invalid proxy-authorization header encoding: {:?}",
+                            req.method(),
+                            req.uri(),
+                            header_value
+                        );
+                        return make_proxy_authentication_required();
+                    }
+                }
+                None => {
+                    error!("HTTP {} URI {} missing proxy-authorization", req.method(), req.uri());
+                    return make_proxy_authentication_required();
+                }
+            }
+        }
 
         // Parse URI
         //
@@ -90,7 +118,7 @@ impl HttpService {
             // Connect to Shadowsocks' remote
             //
             // FIXME: What STATUS should I return for connection error?
-            let (mut stream, server_opt) = match connect_host(self.context, &host, &self.balancer).await {
+            let (mut stream, server_opt) = match connect_host(self.context, &host, Some(&self.balancer)).await {
                 Ok(s) => s,
                 Err(err) => {
                     error!("failed to CONNECT host: {}, error: {}", host, err);
@@ -153,12 +181,24 @@ impl HttpService {
         // Set keep-alive for connection with remote
         set_conn_keep_alive(version, req.headers_mut(), conn_keep_alive);
 
-        let mut res = match self.http_client.send_request(self.context, req, &self.balancer).await {
+        let mut res = match self
+            .http_client
+            .send_request(self.context, req, Some(&self.balancer))
+            .await
+        {
             Ok(resp) => resp,
             Err(HttpClientError::Hyper(e)) => return Err(e),
             Err(HttpClientError::Io(err)) => {
                 error!("failed to make request to host: {}, error: {}", host, err);
                 return make_internal_server_error();
+            }
+            Err(HttpClientError::Http(err)) => {
+                error!("failed to make request to host: {}, error: {}", host, err);
+                return make_bad_request();
+            }
+            Err(HttpClientError::InvalidHeaderValue(err)) => {
+                error!("failed to make request to host: {}, error: {}", host, err);
+                return make_bad_request();
             }
         };
 
@@ -195,6 +235,14 @@ fn empty_body() -> BoxBody<Bytes, hyper::Error> {
 fn make_bad_request() -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     Ok(Response::builder()
         .status(StatusCode::BAD_REQUEST)
+        .body(empty_body())
+        .unwrap())
+}
+
+fn make_proxy_authentication_required() -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+    Ok(Response::builder()
+        .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+        .header(header::PROXY_AUTHENTICATE, "Basic charset=\"UTF-8\"")
         .body(empty_body())
         .unwrap())
 }

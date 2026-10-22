@@ -4,8 +4,10 @@
 use std::path::PathBuf;
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc, time::Duration};
 
+use cfg_if::cfg_if;
 use log::{error, info, trace};
 use shadowsocks::{
+    ManagerListener, ServerAddr,
     config::{Mode, ServerConfig, ServerType, ServerUser, ServerUserManager},
     context::{Context, SharedContext},
     crypto::CipherKind,
@@ -13,23 +15,12 @@ use shadowsocks::{
     manager::{
         datagram::ManagerSocketAddr,
         protocol::{
-            self,
-            AddRequest,
-            AddResponse,
-            ErrorResponse,
-            ListResponse,
-            ManagerRequest,
-            PingResponse,
-            RemoveRequest,
-            RemoveResponse,
-            ServerUserConfig,
-            StatRequest,
+            self, AddRequest, AddResponse, ErrorResponse, ListResponse, ManagerRequest, PingResponse, RemoveRequest,
+            RemoveResponse, ServerUserConfig, StatRequest,
         },
     },
     net::{AcceptOpts, ConnectOpts},
     plugin::PluginConfig,
-    ManagerListener,
-    ServerAddr,
 };
 use tokio::{sync::Mutex, task::JoinHandle};
 
@@ -85,18 +76,17 @@ pub struct ManagerBuilder {
     acl: Option<Arc<AccessControl>>,
     ipv6_first: bool,
     security: SecurityConfig,
-    worker_count: usize,
 }
 
 impl ManagerBuilder {
     /// Create a new manager server builder from configuration
-    pub fn new(svr_cfg: ManagerConfig) -> ManagerBuilder {
-        ManagerBuilder::with_context(svr_cfg, Context::new_shared(ServerType::Server))
+    pub fn new(svr_cfg: ManagerConfig) -> Self {
+        Self::with_context(svr_cfg, Context::new_shared(ServerType::Server))
     }
 
     /// Create a new manager server builder with context and configuration
-    pub(crate) fn with_context(svr_cfg: ManagerConfig, context: SharedContext) -> ManagerBuilder {
-        ManagerBuilder {
+    pub(crate) fn with_context(svr_cfg: ManagerConfig, context: SharedContext) -> Self {
+        Self {
             context,
             svr_cfg,
             connect_opts: ConnectOpts::default(),
@@ -106,7 +96,6 @@ impl ManagerBuilder {
             acl: None,
             ipv6_first: false,
             security: SecurityConfig::default(),
-            worker_count: 1,
         }
     }
 
@@ -156,14 +145,6 @@ impl ManagerBuilder {
         self.security = security;
     }
 
-    /// Set runtime worker count
-    ///
-    /// Should be replaced with tokio's metric API when it is stablized.
-    /// https://github.com/tokio-rs/tokio/issues/4073
-    pub fn set_worker_count(&mut self, worker_count: usize) {
-        self.worker_count = worker_count;
-    }
-
     /// Build the manager server instance
     pub async fn build(self) -> io::Result<Manager> {
         let listener = ManagerListener::bind(&self.context, &self.svr_cfg.addr).await?;
@@ -178,7 +159,6 @@ impl ManagerBuilder {
             acl: self.acl,
             ipv6_first: self.ipv6_first,
             security: self.security,
-            worker_count: self.worker_count,
             listener,
         })
     }
@@ -196,7 +176,6 @@ pub struct Manager {
     acl: Option<Arc<AccessControl>>,
     ipv6_first: bool,
     security: SecurityConfig,
-    worker_count: usize,
     listener: ManagerListener,
 }
 
@@ -255,7 +234,7 @@ impl Manager {
         }
     }
 
-    /// Add a server programatically
+    /// Add a server programmatically
     pub async fn add_server(&self, svr_cfg: ServerConfig) {
         match self.svr_cfg.server_mode {
             ManagerServerMode::Builtin => self.add_server_builtin(svr_cfg).await,
@@ -292,8 +271,6 @@ impl Manager {
         }
 
         server_builder.set_security_config(&self.security);
-
-        server_builder.set_worker_count(self.worker_count);
 
         let server_port = server_builder.server_config().addr().port();
 
@@ -352,20 +329,20 @@ impl Manager {
         };
 
         let pid_path = self.server_pid_path(port);
-        if pid_path.exists() {
-            if let Ok(mut pid_file) = File::open(&pid_path) {
-                let mut pid_content = String::new();
-                if pid_file.read_to_string(&mut pid_content).is_ok() {
-                    let pid_content = pid_content.trim();
+        if pid_path.exists()
+            && let Ok(mut pid_file) = File::open(&pid_path)
+        {
+            let mut pid_content = String::new();
+            if pid_file.read_to_string(&mut pid_content).is_ok() {
+                let pid_content = pid_content.trim();
 
-                    match pid_content.parse::<libc::pid_t>() {
-                        Ok(pid) => {
-                            let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
-                            debug!("killed standalone server port {}, pid: {}", port, pid);
-                        }
-                        Err(..) => {
-                            warn!("failed to read pid from {}", pid_path.display());
-                        }
+                match pid_content.parse::<libc::pid_t>() {
+                    Ok(pid) => {
+                        let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+                        debug!("killed standalone server port {}, pid: {}", port, pid);
+                    }
+                    Err(..) => {
+                        warn!("failed to read pid from {}", pid_path.display());
                     }
                 }
             }
@@ -408,6 +385,15 @@ impl Manager {
         let server_instance = ServerInstanceConfig {
             config: svr_cfg.clone(),
             acl: None, // Set with --acl command line argument
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            outbound_fwmark: None,
+            #[cfg(target_os = "freebsd")]
+            outbound_user_cookie: None,
+            outbound_bind_addr: None,
+            outbound_bind_interface: None,
+            outbound_udp_allow_fragmentation: None,
+            inbound_udp_allow_fragmentation: None,
+            outbound_proxy: Vec::new(),
         };
 
         let mut config = Config::new(ConfigType::Server);
@@ -417,7 +403,12 @@ impl Manager {
 
         let config_file_content = format!("{config}");
 
-        match OpenOptions::new().write(true).create(true).open(&config_file_path) {
+        match OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&config_file_path)
+        {
             Err(err) => {
                 error!(
                     "failed to open {} for writing, error: {}",
@@ -488,10 +479,31 @@ impl Manager {
                     return Ok(AddResponse(err));
                 }
             },
-            None => self.svr_cfg.method.unwrap_or(CipherKind::CHACHA20_POLY1305),
+            None => match self.svr_cfg.method {
+                Some(m) => m,
+                None => {
+                    cfg_if! {
+                        if #[cfg(feature = "aead-cipher")] {
+                            // If AEAD cipher is enabled, use chacha20-poly1305 as default method
+                            // NOTE: This behavior is defined in shadowsocks-libev's `manager.c`
+                            CipherKind::CHACHA20_POLY1305
+                        } else {
+                            // AEAD cipher is disabled, default method is not defined in any standard or implementations.
+                            // TODO: Complete this after discussion.
+                            return Ok(AddResponse("method is required".to_string()));
+                        }
+                    }
+                }
+            },
         };
 
-        let mut svr_cfg = ServerConfig::new(addr, req.password.clone(), method);
+        let mut svr_cfg = match ServerConfig::new(addr, req.password.clone(), method) {
+            Ok(svr_cfg) => svr_cfg,
+            Err(err) => {
+                error!("failed to create ServerConfig, error: {}", err);
+                return Ok(AddResponse("invalid server".to_string()));
+            }
+        };
 
         if let Some(ref plugin) = req.plugin {
             let p = PluginConfig {
@@ -543,10 +555,7 @@ impl Manager {
                             user.password
                         );
 
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "users[].password must be encoded with base64",
-                        ));
+                        return Err(io::Error::other("users[].password must be encoded with base64"));
                     }
                 };
 

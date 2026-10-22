@@ -1,27 +1,20 @@
 //! Shadowsocks Local Server
 
-use std::{
-    future::Future,
-    io::{self, ErrorKind},
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
-use futures::{future, ready};
+use futures::future;
 use log::trace;
 use shadowsocks::{
     config::Mode,
     net::{AcceptOpts, ConnectOpts},
 };
-use tokio::task::JoinHandle;
 
 #[cfg(feature = "local-flow-stat")]
 use crate::{config::LocalFlowStatAddress, net::FlowStat};
 use crate::{
     config::{Config, ConfigType, ProtocolType},
     dns::build_dns_resolver,
+    utils::ServerHandle,
 };
 
 use self::{
@@ -31,8 +24,12 @@ use self::{
 
 #[cfg(feature = "local-dns")]
 use self::dns::{Dns, DnsBuilder};
+#[cfg(feature = "local-fake-dns")]
+use self::fake_dns::{FakeDns, FakeDnsBuilder};
 #[cfg(feature = "local-http")]
 use self::http::{Http, HttpBuilder};
+#[cfg(feature = "local-online-config")]
+use self::online_config::{OnlineConfigService, OnlineConfigServiceBuilder};
 #[cfg(feature = "local-redir")]
 use self::redir::{Redir, RedirBuilder};
 use self::socks::{Socks, SocksBuilder};
@@ -44,10 +41,14 @@ use self::tunnel::{Tunnel, TunnelBuilder};
 pub mod context;
 #[cfg(feature = "local-dns")]
 pub mod dns;
+#[cfg(feature = "local-fake-dns")]
+pub mod fake_dns;
 #[cfg(feature = "local-http")]
 pub mod http;
 pub mod loadbalancing;
 pub mod net;
+#[cfg(feature = "local-online-config")]
+pub mod online_config;
 #[cfg(feature = "local-redir")]
 pub mod redir;
 pub mod socks;
@@ -61,27 +62,6 @@ pub mod utils;
 ///
 /// This is borrowed from Go's `net` library's default setting
 pub(crate) const LOCAL_DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(15);
-
-struct ServerHandle(JoinHandle<io::Result<()>>);
-
-impl Drop for ServerHandle {
-    #[inline]
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-impl Future for ServerHandle {
-    type Output = io::Result<()>;
-
-    #[inline]
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match ready!(Pin::new(&mut self.0).poll(cx)) {
-            Ok(res) => res.into(),
-            Err(err) => Err(io::Error::new(ErrorKind::Other, err)).into(),
-        }
-    }
-}
 
 /// Local Server instance
 pub struct Server {
@@ -97,27 +77,39 @@ pub struct Server {
     dns_servers: Vec<Dns>,
     #[cfg(feature = "local-redir")]
     redir_servers: Vec<Redir>,
+    #[cfg(feature = "local-fake-dns")]
+    fake_dns_servers: Vec<FakeDns>,
     #[cfg(feature = "local-flow-stat")]
     local_stat_addr: Option<LocalFlowStatAddress>,
     #[cfg(feature = "local-flow-stat")]
     flow_stat: Arc<FlowStat>,
+    #[cfg(feature = "local-online-config")]
+    online_config: Option<OnlineConfigService>,
+    /// Shared global `ServiceContext`, for runtime operations on the whole service
+    /// (e.g. hot-reloading the global ACL file)
+    context: Arc<ServiceContext>,
 }
 
 impl Server {
     /// Create a shadowsocks local server
-    pub async fn new(config: Config) -> io::Result<Server> {
+    pub async fn new(config: Config) -> io::Result<Self> {
         assert!(config.config_type == ConfigType::Local && !config.local.is_empty());
 
         trace!("{:?}", config);
 
         // Warning for Stream Ciphers
+        // NOTE: This will only check servers in config.
         #[cfg(feature = "stream-cipher")]
         for inst in config.server.iter() {
             let server = &inst.config;
 
             if server.method().is_stream() {
-                log::warn!("stream cipher {} for server {} have inherent weaknesses (see discussion in https://github.com/shadowsocks/shadowsocks-org/issues/36). \
-                    DO NOT USE. It will be removed in the future.", server.method(), server.addr());
+                log::warn!(
+                    "stream cipher {} for server {} have inherent weaknesses (see discussion in https://github.com/shadowsocks/shadowsocks-org/issues/36). \
+                    DO NOT USE. It will be removed in the future.",
+                    server.method(),
+                    server.addr()
+                );
             }
         }
 
@@ -136,12 +128,14 @@ impl Server {
         let mut connect_opts = ConnectOpts {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             fwmark: config.outbound_fwmark,
+            #[cfg(target_os = "freebsd")]
+            user_cookie: config.outbound_user_cookie,
 
             #[cfg(target_os = "android")]
             vpn_protect_path: config.outbound_vpn_protect_path,
 
             bind_interface: config.outbound_bind_interface,
-            bind_local_addr: config.outbound_bind_addr,
+            bind_local_addr: config.outbound_bind_addr.map(|ip| SocketAddr::new(ip, 0)),
 
             ..Default::default()
         };
@@ -151,6 +145,8 @@ impl Server {
         connect_opts.tcp.fastopen = config.fast_open;
         connect_opts.tcp.keepalive = config.keep_alive.or(Some(LOCAL_DEFAULT_KEEPALIVE_TIMEOUT));
         connect_opts.tcp.mptcp = config.mptcp;
+        connect_opts.udp.mtu = config.udp_mtu;
+        connect_opts.udp.allow_fragmentation = config.outbound_udp_allow_fragmentation;
         context.set_connect_opts(connect_opts);
 
         let mut accept_opts = AcceptOpts {
@@ -163,6 +159,8 @@ impl Server {
         accept_opts.tcp.fastopen = config.fast_open;
         accept_opts.tcp.keepalive = config.keep_alive.or(Some(LOCAL_DEFAULT_KEEPALIVE_TIMEOUT));
         accept_opts.tcp.mptcp = config.mptcp;
+        accept_opts.udp.mtu = config.udp_mtu;
+        accept_opts.udp.allow_fragmentation = config.inbound_udp_allow_fragmentation;
         context.set_accept_opts(accept_opts);
 
         if let Some(resolver) = build_dns_resolver(
@@ -185,6 +183,20 @@ impl Server {
         }
 
         context.set_security_config(&config.security);
+
+        if !config.outbound_proxy.is_empty() {
+            let has_udp = config.local.iter().any(|local| local.config.mode.enable_udp());
+            if has_udp {
+                let preview = crate::net::OutboundProxyClient::from_config(&config.outbound_proxy);
+                if !preview.supports_udp() {
+                    log::warn!(
+                        "outbound proxy chain contains non-SOCKS5 hop(s); UDP traffic will bypass the chain. \
+                         Configure a SOCKS5-only chain to enable UDP relay."
+                    );
+                }
+            }
+            context.set_outbound_proxies(config.outbound_proxy);
+        }
 
         assert!(!config.local.is_empty(), "no valid local server configuration");
 
@@ -218,13 +230,17 @@ impl Server {
             }
 
             for server in config.server {
-                balancer_builder.add_server(server.config);
+                balancer_builder.add_server(server);
             }
 
             balancer_builder.build().await?
         };
 
-        let mut local_server = Server {
+        // Keep a shared copy of the global context, for runtime operations that need
+        // a handle to the whole service (e.g. hot-reloading the global ACL)
+        let global_context = Arc::new(context.clone());
+
+        let mut local_server = Self {
             balancer: balancer.clone(),
             socks_servers: Vec::new(),
             #[cfg(feature = "local-tunnel")]
@@ -237,10 +253,28 @@ impl Server {
             dns_servers: Vec::new(),
             #[cfg(feature = "local-redir")]
             redir_servers: Vec::new(),
+            #[cfg(feature = "local-fake-dns")]
+            fake_dns_servers: Vec::new(),
             #[cfg(feature = "local-flow-stat")]
             local_stat_addr: config.local_stat_addr,
             #[cfg(feature = "local-flow-stat")]
             flow_stat: context.flow_stat(),
+            #[cfg(feature = "local-online-config")]
+            online_config: match config.online_config {
+                None => None,
+                Some(online_config) => {
+                    let mut builder = OnlineConfigServiceBuilder::new(
+                        Arc::new(context.clone()),
+                        online_config.config_url,
+                        balancer.clone(),
+                    );
+                    if let Some(update_interval) = online_config.update_interval {
+                        builder.set_update_interval(update_interval);
+                    }
+                    Some(builder.build().await?)
+                }
+            },
+            context: global_context,
         };
 
         for local_instance in config.local {
@@ -262,12 +296,14 @@ impl Server {
                 ProtocolType::Socks => {
                     let client_addr = match local_config.addr {
                         Some(a) => a,
-                        None => return Err(io::Error::new(ErrorKind::Other, "socks requires local address")),
+                        None => return Err(io::Error::other("socks requires local address")),
                     };
 
                     let mut server_builder = SocksBuilder::with_context(context.clone(), client_addr, balancer);
                     server_builder.set_mode(local_config.mode);
                     server_builder.set_socks5_auth(local_config.socks5_auth);
+                    #[cfg(feature = "local-http")]
+                    server_builder.set_http_auth(local_config.http_auth);
 
                     if let Some(c) = config.udp_max_associations {
                         server_builder.set_udp_capacity(c);
@@ -277,6 +313,9 @@ impl Server {
                     }
                     if let Some(b) = local_config.udp_addr {
                         server_builder.set_udp_bind_addr(b.clone());
+                    }
+                    if let Some(b) = local_config.udp_associate_addr {
+                        server_builder.set_udp_associate_addr(b.clone());
                     }
 
                     #[cfg(target_os = "macos")]
@@ -295,7 +334,7 @@ impl Server {
                 ProtocolType::Tunnel => {
                     let client_addr = match local_config.addr {
                         Some(a) => a,
-                        None => return Err(io::Error::new(ErrorKind::Other, "tunnel requires local address")),
+                        None => return Err(io::Error::other("tunnel requires local address")),
                     };
 
                     let forward_addr = local_config.forward_addr.expect("tunnel requires forward address");
@@ -330,11 +369,12 @@ impl Server {
                 ProtocolType::Http => {
                     let client_addr = match local_config.addr {
                         Some(a) => a,
-                        None => return Err(io::Error::new(ErrorKind::Other, "http requires local address")),
+                        None => return Err(io::Error::other("http requires local address")),
                     };
 
                     #[allow(unused_mut)]
                     let mut builder = HttpBuilder::with_context(context.clone(), client_addr, balancer);
+                    builder.set_http_auth(local_config.http_auth);
 
                     #[cfg(target_os = "macos")]
                     if let Some(n) = local_config.launchd_tcp_socket_name {
@@ -348,7 +388,7 @@ impl Server {
                 ProtocolType::Redir => {
                     let client_addr = match local_config.addr {
                         Some(a) => a,
-                        None => return Err(io::Error::new(ErrorKind::Other, "redir requires local address")),
+                        None => return Err(io::Error::other("redir requires local address")),
                     };
 
                     let mut server_builder = RedirBuilder::with_context(context.clone(), client_addr, balancer);
@@ -372,7 +412,7 @@ impl Server {
                 ProtocolType::Dns => {
                     let client_addr = match local_config.addr {
                         Some(a) => a,
-                        None => return Err(io::Error::new(ErrorKind::Other, "dns requires local address")),
+                        None => return Err(io::Error::other("dns requires local address")),
                     };
 
                     let mut server_builder = {
@@ -479,6 +519,32 @@ impl Server {
                     let server = builder.build().await?;
                     local_server.tun_servers.push(server);
                 }
+                #[cfg(feature = "local-fake-dns")]
+                ProtocolType::FakeDns => {
+                    let client_addr = match local_config.addr {
+                        Some(a) => a,
+                        None => return Err(io::Error::other("dns requires local address")),
+                    };
+
+                    let mut builder = FakeDnsBuilder::new(client_addr);
+                    if let Some(n) = local_config.fake_dns_ipv4_network {
+                        builder.set_ipv4_network(n);
+                    }
+                    if let Some(n) = local_config.fake_dns_ipv6_network {
+                        builder.set_ipv6_network(n);
+                    }
+                    if let Some(exp) = local_config.fake_dns_record_expire_duration {
+                        builder.set_expire_duration(exp);
+                    }
+                    if let Some(p) = local_config.fake_dns_database_path {
+                        builder.set_database_path(p);
+                    }
+                    let server = builder.build().await?;
+                    #[cfg(feature = "local-fake-dns")]
+                    context.add_fake_dns_manager(server.clone_manager()).await;
+
+                    local_server.fake_dns_servers.push(server);
+                }
             }
         }
 
@@ -518,12 +584,22 @@ impl Server {
             vfut.push(ServerHandle(tokio::spawn(svr.run())));
         }
 
+        #[cfg(feature = "local-fake-dns")]
+        for svr in self.fake_dns_servers {
+            vfut.push(ServerHandle(tokio::spawn(svr.run())));
+        }
+
         #[cfg(feature = "local-flow-stat")]
         if let Some(stat_addr) = self.local_stat_addr {
             // For Android's flow statistic
 
             let report_fut = flow_report_task(stat_addr, self.flow_stat);
             vfut.push(ServerHandle(tokio::spawn(report_fut)));
+        }
+
+        #[cfg(feature = "local-online-config")]
+        if let Some(online_config) = self.online_config {
+            vfut.push(ServerHandle(tokio::spawn(online_config.run())));
         }
 
         let (res, ..) = future::select_all(vfut).await;
@@ -533,6 +609,16 @@ impl Server {
     /// Get the internal server balancer
     pub fn server_balancer(&self) -> &PingBalancer {
         &self.balancer
+    }
+
+    /// Get a shareable handle to the global [`ServiceContext`]
+    ///
+    /// The returned context is shared with every listener. It can be used for runtime
+    /// operations on the whole service, e.g. hot-reloading the global ACL file with
+    /// [`ServiceContext::reload_acl`], typically triggered by a signal. Contexts with
+    /// their own private ACL (`local.acl` in the configuration file) are not affected.
+    pub fn context(&self) -> Arc<ServiceContext> {
+        self.context.clone()
     }
 
     /// Get SOCKS server instances
@@ -568,6 +654,12 @@ impl Server {
     #[cfg(feature = "local-redir")]
     pub fn redir_servers(&self) -> &[Redir] {
         &self.redir_servers
+    }
+
+    /// Get Fake DNS instances
+    #[cfg(feature = "local-fake-dns")]
+    pub fn fake_dns_servers(&self) -> &[FakeDns] {
+        &self.fake_dns_servers
     }
 }
 

@@ -25,6 +25,7 @@ use crate::{
     },
 };
 
+#[derive(Debug)]
 enum ProxyServerStreamWriteState {
     #[cfg(feature = "aead-cipher-2022")]
     PrepareHeader(Option<std::task::Waker>),
@@ -32,6 +33,7 @@ enum ProxyServerStreamWriteState {
 }
 
 /// A stream for communicating with shadowsocks' proxy client
+#[derive(Debug)]
 #[pin_project]
 pub struct ProxyServerStream<S> {
     #[pin]
@@ -42,13 +44,21 @@ pub struct ProxyServerStream<S> {
 }
 
 impl<S> ProxyServerStream<S> {
-    pub(crate) fn from_stream(
+    /// Create a `ProxyServerStream` from a connection stream
+    pub fn from_stream(context: SharedContext, stream: S, method: CipherKind, key: &[u8]) -> Self {
+        Self::from_stream_with_user_manager(context, stream, method, key, None)
+    }
+
+    /// Create a `ProxyServerStream` from a connection stream
+    ///
+    /// Set `user_manager` to enable support of verifying EIH users.
+    pub fn from_stream_with_user_manager(
         context: SharedContext,
         stream: S,
         method: CipherKind,
         key: &[u8],
         user_manager: Option<Arc<ServerUserManager>>,
-    ) -> ProxyServerStream<S> {
+    ) -> Self {
         #[cfg(feature = "aead-cipher-2022")]
         let writer_state = if method.is_aead_2022() {
             ProxyServerStreamWriteState::PrepareHeader(None)
@@ -59,8 +69,8 @@ impl<S> ProxyServerStream<S> {
         #[cfg(not(feature = "aead-cipher-2022"))]
         let writer_state = ProxyServerStreamWriteState::Established;
 
-        static EMPTY_IDENTITY: [Bytes; 0] = [];
-        ProxyServerStream {
+        const EMPTY_IDENTITY: [Bytes; 0] = [];
+        Self {
             stream: CryptoStream::from_stream_with_identity(
                 &context,
                 stream,
@@ -90,6 +100,12 @@ impl<S> ProxyServerStream<S> {
     pub fn into_inner(self) -> S {
         self.stream.into_inner()
     }
+
+    /// Get authenticated user key after handshake (AEAD2022 multi-user mode).
+    /// Returns `None` in single-user mode or before the handshake completes.
+    pub fn user_key(&self) -> Option<&[u8]> {
+        self.stream.user_key()
+    }
 }
 
 impl<S> ProxyServerStream<S>
@@ -101,7 +117,7 @@ where
     /// This method should be called only once after accepted.
     pub async fn handshake(&mut self) -> io::Result<Address> {
         if self.has_handshaked {
-            return Err(io::Error::new(io::ErrorKind::Other, "stream is already handshaked"));
+            return Err(io::Error::other("stream is already handshaked"));
         }
 
         self.has_handshaked = true;
@@ -121,10 +137,7 @@ where
                 if chunk_count == 1 && chunk_remaining == 0 {
                     // Header is the end of the data chunk, so no payload is in the first chunk, and padding == 0.
                     // REJECT insecure clients.
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "no payload in first data chunk, and padding is 0",
-                    ));
+                    return Err(io::Error::other("no payload in first data chunk, and padding is 0"));
                 } else if chunk_count > 1 {
                     warn!(
                         "tcp header is separated in {} chunks, client is not following the AEAD-2022 spec",
@@ -144,7 +157,7 @@ where
     #[inline]
     fn poll_read(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         if !self.has_handshaked {
-            return Err(io::Error::new(io::ErrorKind::Other, "stream is not handshaked yet")).into();
+            return Err(io::Error::other("stream is not handshaked yet")).into();
         }
 
         let this = self.project();
@@ -152,10 +165,10 @@ where
 
         // Wakeup writer task because we have already received the salt
         #[cfg(feature = "aead-cipher-2022")]
-        if let ProxyServerStreamWriteState::PrepareHeader(ref mut waker) = this.writer_state {
-            if let Some(waker) = waker.take() {
-                waker.wake();
-            }
+        if let ProxyServerStreamWriteState::PrepareHeader(waker) = this.writer_state
+            && let Some(waker) = waker.take()
+        {
+            waker.wake();
         }
 
         Ok(()).into()
@@ -183,10 +196,10 @@ where
                         *(this.writer_state) = ProxyServerStreamWriteState::Established;
                     } else {
                         // Reader didn't receive the salt from client yet.
-                        if let Some(waker) = waker.take() {
-                            if !waker.will_wake(cx.waker()) {
-                                waker.wake();
-                            }
+                        if let Some(waker) = waker.take()
+                            && !waker.will_wake(cx.waker())
+                        {
+                            waker.wake();
                         }
                         *waker = Some(cx.waker().clone());
                         return Poll::Pending;

@@ -2,11 +2,14 @@
 //!
 //! https://www.ietf.org/rfc/rfc2068.txt
 
-pub use self::server::{Http, HttpBuilder, HttpConnectionHandler};
+pub use self::{
+    http_client::{HttpClient, HttpClientError},
+    server::{Http, HttpBuilder, HttpConnectionHandler},
+};
 
+pub mod config;
 mod http_client;
 mod http_service;
-mod http_stream;
 pub mod server;
-mod tokio_rt;
+pub(crate) mod tokio_rt;
 mod utils;

@@ -1,17 +1,16 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    ffi::{c_void, CStr, CString, OsString},
+    ffi::{CStr, CString, OsString, c_void},
     io::{self, ErrorKind},
     mem,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::windows::{
         ffi::OsStringExt,
-        io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket},
+        io::{AsRawSocket, AsSocket, RawSocket},
     },
     pin::Pin,
-    ptr,
-    slice,
+    ptr, slice,
     task::{self, Poll},
     time::{Duration, Instant},
 };
@@ -19,56 +18,31 @@ use std::{
 use bytes::BytesMut;
 use log::{error, warn};
 use pin_project::pin_project;
-use socket2::{Domain, Protocol, SockAddr, Socket, TcpKeepalive, Type};
+use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, TcpKeepalive, Type};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpSocket, TcpStream as TokioTcpStream, UdpSocket},
 };
 use tokio_tfo::TfoStream;
 use windows_sys::{
-    core::PCSTR,
     Win32::{
-        Foundation::{BOOL, ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, ERROR_SUCCESS},
+        Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, ERROR_SUCCESS, FALSE},
         NetworkManagement::IpHelper::{
-            if_nametoindex,
-            GetAdaptersAddresses,
-            GAA_FLAG_SKIP_ANYCAST,
-            GAA_FLAG_SKIP_DNS_SERVER,
-            GAA_FLAG_SKIP_MULTICAST,
-            GAA_FLAG_SKIP_UNICAST,
-            IP_ADAPTER_ADDRESSES_LH,
+            GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST,
+            GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, if_nametoindex,
         },
         Networking::WinSock::{
-            htonl,
-            setsockopt,
-            WSAGetLastError,
-            WSAIoctl,
-            AF_UNSPEC,
-            IPPROTO_IP,
-            IPPROTO_IPV6,
-            IPPROTO_TCP,
-            IPV6_MTU_DISCOVER,
-            IPV6_UNICAST_IF,
-            IP_MTU_DISCOVER,
-            IP_PMTUDISC_DO,
-            IP_UNICAST_IF,
-            SIO_UDP_CONNRESET,
-            SOCKET,
-            SOCKET_ERROR,
-            TCP_FASTOPEN,
+            AF_UNSPEC, IP_MTU_DISCOVER, IP_PMTUDISC_DO, IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP,
+            IPV6_MTU_DISCOVER, IPV6_UNICAST_IF, SIO_UDP_CONNRESET, SOCKET, SOCKET_ERROR, TCP_FASTOPEN, WSAGetLastError,
+            WSAIoctl, htonl, setsockopt,
         },
     },
+    core::{BOOL, PCSTR},
 };
 
-// BOOL values
-const FALSE: BOOL = 0;
-
 use crate::net::{
-    is_dual_stack_addr,
+    AcceptOpts, AddrFamily, ConnectOpts, is_dual_stack_addr,
     sys::{set_common_sockopt_for_connect, socket_bind_dual_stack},
-    AcceptOpts,
-    AddrFamily,
-    ConnectOpts,
 };
 
 /// A `TcpStream` that supports TFO (TCP Fast Open)
@@ -191,8 +165,8 @@ pub fn set_tcp_fastopen<S: AsRawSocket>(socket: &S) -> io::Result<()> {
     unsafe {
         let ret = setsockopt(
             socket.as_raw_socket() as SOCKET,
-            IPPROTO_TCP as i32,
-            TCP_FASTOPEN as i32,
+            IPPROTO_TCP,
+            TCP_FASTOPEN,
             &enable as *const _ as PCSTR,
             mem::size_of_val(&enable) as i32,
         );
@@ -243,10 +217,7 @@ fn find_adapter_interface_index(addr: &SocketAddr, iface: &str) -> io::Result<Op
                 }
                 ERROR_NO_DATA => return Ok(None),
                 _ => {
-                    let err = io::Error::new(
-                        ErrorKind::Other,
-                        format!("GetAdaptersAddresses failed with error: {}", ret),
-                    );
+                    let err = io::Error::other(format!("GetAdaptersAddresses failed with error: {}", ret));
                     return Err(err);
                 }
             }
@@ -262,12 +233,12 @@ fn find_adapter_interface_index(addr: &SocketAddr, iface: &str) -> io::Result<Op
             let friendly_name_len: usize = libc::wcslen(ip_adapter_address.FriendlyName);
             let friendly_name_slice: &[u16] = slice::from_raw_parts(ip_adapter_address.FriendlyName, friendly_name_len);
             let friendly_name_os = OsString::from_wide(friendly_name_slice); // UTF-16 to UTF-8
-            if let Some(friendly_name) = friendly_name_os.to_str() {
-                if friendly_name == iface {
-                    match ip {
-                        IpAddr::V4(..) => return Ok(Some(ip_adapter_address.Anonymous1.Anonymous.IfIndex)),
-                        IpAddr::V6(..) => return Ok(Some(ip_adapter_address.Ipv6IfIndex)),
-                    }
+            if let Some(friendly_name) = friendly_name_os.to_str()
+                && friendly_name == iface
+            {
+                match ip {
+                    IpAddr::V4(..) => return Ok(Some(ip_adapter_address.Anonymous1.Anonymous.IfIndex)),
+                    IpAddr::V6(..) => return Ok(Some(ip_adapter_address.Ipv6IfIndex)),
                 }
             }
 
@@ -343,8 +314,8 @@ fn set_ip_unicast_if<S: AsRawSocket>(socket: &S, addr: &SocketAddr, iface: &str)
                 let if_index = htonl(if_index);
                 setsockopt(
                     handle,
-                    IPPROTO_IP as i32,
-                    IP_UNICAST_IF as i32,
+                    IPPROTO_IP,
+                    IP_UNICAST_IF,
                     &if_index as *const _ as PCSTR,
                     mem::size_of_val(&if_index) as i32,
                 )
@@ -353,8 +324,8 @@ fn set_ip_unicast_if<S: AsRawSocket>(socket: &S, addr: &SocketAddr, iface: &str)
                 // Interface index is in host byte order for IPPROTO_IPV6.
                 setsockopt(
                     handle,
-                    IPPROTO_IPV6 as i32,
-                    IPV6_UNICAST_IF as i32,
+                    IPPROTO_IPV6,
+                    IPV6_UNICAST_IF,
                     &if_index as *const _ as PCSTR,
                     mem::size_of_val(&if_index) as i32,
                 )
@@ -426,8 +397,8 @@ pub fn set_disable_ip_fragmentation<S: AsRawSocket>(af: AddrFamily, socket: &S) 
         let value = IP_PMTUDISC_DO;
         let ret = setsockopt(
             handle,
-            IPPROTO_IP as i32,
-            IP_MTU_DISCOVER as i32,
+            IPPROTO_IP,
+            IP_MTU_DISCOVER,
             &value as *const _ as PCSTR,
             mem::size_of_val(&value) as i32,
         );
@@ -441,8 +412,8 @@ pub fn set_disable_ip_fragmentation<S: AsRawSocket>(af: AddrFamily, socket: &S) 
             let value = IP_PMTUDISC_DO;
             let ret = setsockopt(
                 handle,
-                IPPROTO_IPV6 as i32,
-                IPV6_MTU_DISCOVER as i32,
+                IPPROTO_IPV6,
+                IPV6_MTU_DISCOVER,
                 &value as *const _ as PCSTR,
                 mem::size_of_val(&value) as i32,
             );
@@ -460,7 +431,11 @@ pub fn set_disable_ip_fragmentation<S: AsRawSocket>(af: AddrFamily, socket: &S) 
 /// Create a `UdpSocket` binded to `addr`
 ///
 /// It also disables `WSAECONNRESET` for UDP socket
-pub async fn create_inbound_udp_socket(addr: &SocketAddr, ipv6_only: bool) -> io::Result<UdpSocket> {
+pub async fn create_inbound_udp_socket(
+    addr: &SocketAddr,
+    ipv6_only: bool,
+    allow_fragmentation: bool,
+) -> io::Result<UdpSocket> {
     let set_dual_stack = is_dual_stack_addr(addr);
 
     let socket = if !set_dual_stack {
@@ -478,7 +453,7 @@ pub async fn create_inbound_udp_socket(addr: &SocketAddr, ipv6_only: bool) -> io
         SocketAddr::V4(..) => AddrFamily::Ipv4,
         SocketAddr::V6(..) => AddrFamily::Ipv6,
     };
-    if let Err(err) = set_disable_ip_fragmentation(addr_family, &socket) {
+    if !allow_fragmentation && let Err(err) = set_disable_ip_fragmentation(addr_family, &socket) {
         warn!("failed to disable IP fragmentation, error: {}", err);
     }
     disable_connection_reset(&socket)?;
@@ -490,8 +465,19 @@ pub async fn create_inbound_udp_socket(addr: &SocketAddr, ipv6_only: bool) -> io
 #[inline(always)]
 pub async fn create_outbound_udp_socket(af: AddrFamily, opts: &ConnectOpts) -> io::Result<UdpSocket> {
     let bind_addr = match (af, opts.bind_local_addr) {
-        (AddrFamily::Ipv4, Some(IpAddr::V4(ip))) => SocketAddr::new(ip.into(), 0),
-        (AddrFamily::Ipv6, Some(IpAddr::V6(ip))) => SocketAddr::new(ip.into(), 0),
+        (AddrFamily::Ipv4, Some(SocketAddr::V4(addr))) => addr.into(),
+        (AddrFamily::Ipv4, Some(SocketAddr::V6(addr))) => {
+            // Map IPv6 bind_local_addr to IPv4 if AF is IPv4
+            match addr.ip().to_ipv4_mapped() {
+                Some(addr) => SocketAddr::new(addr.into(), 0),
+                None => return Err(io::Error::new(ErrorKind::InvalidInput, "Invalid IPv6 address")),
+            }
+        }
+        (AddrFamily::Ipv6, Some(SocketAddr::V6(addr))) => addr.into(),
+        (AddrFamily::Ipv6, Some(SocketAddr::V4(addr))) => {
+            // Map IPv4 bind_local_addr to IPv6 if AF is IPv6
+            SocketAddr::new(addr.ip().to_ipv6_mapped().into(), 0)
+        }
         (AddrFamily::Ipv4, ..) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
         (AddrFamily::Ipv6, ..) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
     };
@@ -520,7 +506,9 @@ pub async fn bind_outbound_udp_socket(bind_addr: &SocketAddr, opts: &ConnectOpts
     socket.set_nonblocking(true)?;
     let socket = UdpSocket::from_std(socket.into())?;
 
-    if let Err(err) = set_disable_ip_fragmentation(af, &socket) {
+    if !opts.udp.allow_fragmentation
+        && let Err(err) = set_disable_ip_fragmentation(af, &socket)
+    {
         warn!("failed to disable IP fragmentation, error: {}", err);
     }
     disable_connection_reset(&socket)?;
@@ -529,20 +517,25 @@ pub async fn bind_outbound_udp_socket(bind_addr: &SocketAddr, opts: &ConnectOpts
 }
 
 #[inline(always)]
-fn socket_call_warp<S: AsRawSocket, F: FnOnce(&Socket) -> io::Result<()>>(stream: &S, f: F) -> io::Result<()> {
-    let socket = unsafe { Socket::from_raw_socket(stream.as_raw_socket()) };
-    let result = f(&socket);
-    let _ = socket.into_raw_socket();
-    result
+fn socket_call_warp<S, F>(stream: &S, f: F) -> io::Result<()>
+where
+    S: AsSocket,
+    F: FnOnce(&Socket) -> io::Result<()>,
+{
+    let socket = SockRef::from(stream);
+    f(&socket)
 }
 
-pub fn set_common_sockopt_after_connect<S: AsRawSocket>(stream: &S, opts: &ConnectOpts) -> io::Result<()> {
+pub fn set_common_sockopt_after_connect<S>(stream: &S, opts: &ConnectOpts) -> io::Result<()>
+where
+    S: AsSocket,
+{
     socket_call_warp(stream, |socket| set_common_sockopt_after_connect_impl(socket, opts))
 }
 
 fn set_common_sockopt_after_connect_impl(socket: &Socket, opts: &ConnectOpts) -> io::Result<()> {
     if opts.tcp.nodelay {
-        socket.set_nodelay(true)?;
+        socket.set_tcp_nodelay(true)?;
     }
 
     if let Some(intv) = opts.tcp.keepalive {
@@ -553,7 +546,10 @@ fn set_common_sockopt_after_connect_impl(socket: &Socket, opts: &ConnectOpts) ->
     Ok(())
 }
 
-pub fn set_common_sockopt_after_accept<S: AsRawSocket>(stream: &S, opts: &AcceptOpts) -> io::Result<()> {
+pub fn set_common_sockopt_after_accept<S>(stream: &S, opts: &AcceptOpts) -> io::Result<()>
+where
+    S: AsSocket,
+{
     socket_call_warp(stream, |socket| set_common_sockopt_after_accept_impl(socket, opts))
 }
 
@@ -566,7 +562,7 @@ fn set_common_sockopt_after_accept_impl(socket: &Socket, opts: &AcceptOpts) -> i
         socket.set_recv_buffer_size(buf_size as usize)?;
     }
 
-    socket.set_nodelay(opts.tcp.nodelay)?;
+    socket.set_tcp_nodelay(opts.tcp.nodelay)?;
 
     if let Some(intv) = opts.tcp.keepalive {
         let keepalive = TcpKeepalive::new().with_time(intv).with_interval(intv);

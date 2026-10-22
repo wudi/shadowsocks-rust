@@ -2,45 +2,126 @@
 
 use std::{
     cell::RefCell,
-    io::{self, ErrorKind},
+    io,
     marker::PhantomData,
     net::{SocketAddr, SocketAddrV6},
     sync::Arc,
     time::Duration,
 };
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future;
 use log::{debug, error, trace, warn};
 use lru_time_cache::LruCache;
-use rand::{rngs::SmallRng, Rng, SeedableRng};
+use rand::{RngExt, rngs::SmallRng};
 use tokio::{sync::mpsc, task::JoinHandle, time};
 
 use shadowsocks::{
+    config::ServerConfig,
     lookup_then,
-    net::{AddrFamily, UdpSocket as ShadowUdpSocket},
+    net::{AddrFamily, ConnectOpts, TcpStream as ShadowTcpStream, UdpSocket as ShadowUdpSocket},
     relay::{
-        udprelay::{options::UdpSocketControlData, ProxySocket, MAXIMUM_UDP_PAYLOAD_SIZE},
         Address,
+        udprelay::{
+            MAXIMUM_UDP_PAYLOAD_SIZE, ProxySocket,
+            options::UdpSocketControlData,
+            proxy_socket::UdpSocketType,
+        },
     },
 };
 
 use crate::{
     local::{context::ServiceContext, loadbalancing::PingBalancer},
     net::{
+        MonProxySocket, OutboundProxyDatagram, TcpDialer,
+        UDP_ASSOCIATION_KEEP_ALIVE_CHANNEL_SIZE, UDP_ASSOCIATION_SEND_CHANNEL_SIZE,
         packet_window::PacketWindowFilter,
-        MonProxySocket,
-        UDP_ASSOCIATION_KEEP_ALIVE_CHANNEL_SIZE,
-        UDP_ASSOCIATION_SEND_CHANNEL_SIZE,
     },
 };
 
+/// Build the proxied socket appropriate for `svr_cfg`, transparently
+/// going through the configured outbound chain when one is present and
+/// fully SOCKS5 (otherwise the chain is bypassed for UDP).
+async fn create_proxied_socket(
+    context: &ServiceContext,
+    svr_cfg: &ServerConfig,
+    connect_opts: &ConnectOpts,
+) -> io::Result<ProxiedSocket> {
+    let use_chain = context
+        .outbound_client()
+        .map(|c| c.supports_udp())
+        .unwrap_or(false);
+
+    if use_chain {
+        let client = context
+            .outbound_client()
+            .expect("outbound_client checked above")
+            .clone();
+        let dialer = LocalTcpDialer {
+            context: Arc::new(context.clone()),
+            opts: connect_opts.clone(),
+        };
+        let target: Address = svr_cfg.udp_external_addr().into();
+        let datagram = client
+            .associate_udp(&context.context(), &dialer, connect_opts, target)
+            .await?;
+        let proxy_socket =
+            ProxySocket::from_socket(UdpSocketType::Client, context.context(), svr_cfg, datagram);
+        let mon = MonProxySocket::from_socket(proxy_socket, context.flow_stat());
+        Ok(ProxiedSocket::Chained(mon))
+    } else {
+        let socket = ProxySocket::connect_with_opts(context.context(), svr_cfg, connect_opts).await?;
+        let mon = MonProxySocket::from_socket(socket, context.flow_stat());
+        Ok(ProxiedSocket::Direct(mon))
+    }
+}
+
+/// `TcpDialer` adapter that uses the local service context's connect options.
+struct LocalTcpDialer {
+    context: Arc<ServiceContext>,
+    opts: ConnectOpts,
+}
+
+impl TcpDialer for LocalTcpDialer {
+    async fn dial(&self, addr: &Address) -> io::Result<ShadowTcpStream> {
+        ShadowTcpStream::connect_remote_with_opts(self.context.context_ref(), addr, &self.opts).await
+    }
+}
+
+/// Proxied UDP socket, either direct (single hop to ss-server) or routed
+/// through a SOCKS5-only outbound proxy chain.
+#[allow(clippy::large_enum_variant)]
+enum ProxiedSocket {
+    Direct(MonProxySocket<ShadowUdpSocket>),
+    Chained(MonProxySocket<OutboundProxyDatagram>),
+}
+
+impl ProxiedSocket {
+    async fn send_with_ctrl(
+        &self,
+        addr: &Address,
+        control: &UdpSocketControlData,
+        data: &[u8],
+    ) -> io::Result<()> {
+        match self {
+            Self::Direct(s) => s.send_with_ctrl(addr, control, data).await,
+            Self::Chained(s) => s.send_with_ctrl(addr, control, data).await,
+        }
+    }
+
+    async fn recv_with_ctrl(
+        &self,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, Address, Option<UdpSocketControlData>)> {
+        match self {
+            Self::Direct(s) => s.recv_with_ctrl(buf).await,
+            Self::Chained(s) => s.recv_with_ctrl(buf).await,
+        }
+    }
+}
+
 /// Writer for sending packets back to client
-///
-/// Currently it requires `async-trait` for `async fn` in trait, which will allocate a `Box`ed `Future` every call of `send_to`.
-/// This performance issue could be solved when `generic_associated_types` and `generic_associated_types` are stabilized.
-#[async_trait]
+#[trait_variant::make(Send)]
 pub trait UdpInboundWrite {
     /// Sends packet `data` received from `remote_addr` back to `peer_addr`
     async fn send_to(&self, peer_addr: SocketAddr, remote_addr: &Address, data: &[u8]) -> io::Result<()>;
@@ -74,7 +155,7 @@ where
         time_to_live: Option<Duration>,
         capacity: Option<usize>,
         balancer: PingBalancer,
-    ) -> (UdpAssociationManager<W>, Duration, mpsc::Receiver<SocketAddr>) {
+    ) -> (Self, Duration, mpsc::Receiver<SocketAddr>) {
         let time_to_live = time_to_live.unwrap_or(crate::DEFAULT_UDP_EXPIRY_DURATION);
         let assoc_map = match capacity {
             Some(capacity) => LruCache::with_expiry_duration_and_capacity(time_to_live, capacity),
@@ -84,7 +165,7 @@ where
         let (keepalive_tx, keepalive_rx) = mpsc::channel(UDP_ASSOCIATION_KEEP_ALIVE_CHANNEL_SIZE);
 
         (
-            UdpAssociationManager {
+            Self {
                 respond_writer,
                 context,
                 assoc_map,
@@ -98,7 +179,13 @@ where
     }
 
     /// Sends `data` from `peer_addr` to `target_addr`
-    pub async fn send_to(&mut self, peer_addr: SocketAddr, target_addr: Address, data: &[u8]) -> io::Result<()> {
+    #[cfg_attr(not(feature = "local-fake-dns"), allow(unused_mut))]
+    pub async fn send_to(&mut self, peer_addr: SocketAddr, mut target_addr: Address, data: &[u8]) -> io::Result<()> {
+        #[cfg(feature = "local-fake-dns")]
+        if let Some(mapped_addr) = self.context.try_map_fake_address(&target_addr).await {
+            target_addr = mapped_addr;
+        }
+
         // Check or (re)create an association
 
         if let Some(assoc) = self.assoc_map.get(&peer_addr) {
@@ -162,7 +249,7 @@ where
         balancer: PingBalancer,
         respond_writer: W,
         server_session_expire_duration: Duration,
-    ) -> UdpAssociation<W> {
+    ) -> Self {
         let (assoc_handle, sender) = UdpAssociationContext::create(
             context,
             peer_addr,
@@ -171,7 +258,7 @@ where
             respond_writer,
             server_session_expire_duration,
         );
-        UdpAssociation {
+        Self {
             assoc_handle,
             sender,
             writer: PhantomData,
@@ -180,7 +267,7 @@ where
 
     fn try_send(&self, data: (Address, Bytes)) -> io::Result<()> {
         if self.sender.try_send(data).is_err() {
-            let err = io::Error::new(ErrorKind::Other, "udp relay channel full");
+            let err = io::Error::other("udp relay channel full");
             return Err(err);
         }
         Ok(())
@@ -198,8 +285,8 @@ struct ServerSessionContext {
 }
 
 impl ServerSessionContext {
-    fn new(session_expire_duration: Duration) -> ServerSessionContext {
-        ServerSessionContext {
+    fn new(session_expire_duration: Duration) -> Self {
+        Self {
             server_session_map: LruCache::with_expiry_duration(session_expire_duration),
         }
     }
@@ -213,7 +300,7 @@ where
     peer_addr: SocketAddr,
     bypassed_ipv4_socket: Option<ShadowUdpSocket>,
     bypassed_ipv6_socket: Option<ShadowUdpSocket>,
-    proxied_socket: Option<MonProxySocket>,
+    proxied_socket: Option<ProxiedSocket>,
     keepalive_tx: mpsc::Sender<SocketAddr>,
     keepalive_flag: bool,
     balancer: PingBalancer,
@@ -234,12 +321,18 @@ where
 }
 
 thread_local! {
-    static CLIENT_SESSION_RNG: RefCell<SmallRng> = RefCell::new(SmallRng::from_entropy());
+    static CLIENT_SESSION_RNG: RefCell<SmallRng> = RefCell::new(rand::make_rng());
 }
 
+/// Generate an AEAD-2022 Client SessionID
 #[inline]
-fn generate_client_session_id() -> u64 {
-    CLIENT_SESSION_RNG.with(|rng| rng.borrow_mut().gen())
+pub fn generate_client_session_id() -> u64 {
+    loop {
+        let id = CLIENT_SESSION_RNG.with(|rng| rng.borrow_mut().random());
+        if id != 0 {
+            break id;
+        }
+    }
 }
 
 impl<W> UdpAssociationContext<W>
@@ -259,7 +352,7 @@ where
         // being OOM.
         let (sender, receiver) = mpsc::channel(UDP_ASSOCIATION_SEND_CHANNEL_SIZE);
 
-        let mut assoc = UdpAssociationContext {
+        let mut assoc = Self {
             context,
             peer_addr,
             bypassed_ipv4_socket: None,
@@ -404,7 +497,7 @@ where
 
         #[inline]
         async fn receive_from_proxied_opt(
-            socket: &Option<MonProxySocket>,
+            socket: &Option<ProxiedSocket>,
             buf: &mut Vec<u8>,
         ) -> io::Result<(usize, Address, Option<UdpSocketControlData>)> {
             match *socket {
@@ -473,8 +566,6 @@ where
             target_os = "watchos",
             target_os = "tvos",
             target_os = "freebsd",
-            // target_os = "dragonfly",
-            // target_os = "netbsd",
             target_os = "windows",
         ));
 
@@ -511,11 +602,9 @@ where
             }
         };
 
-        if UDP_SOCKET_SUPPORT_DUAL_STACK {
-            if let SocketAddr::V4(saddr) = target_addr {
-                let mapped_ip = saddr.ip().to_ipv6_mapped();
-                target_addr = SocketAddr::V6(SocketAddrV6::new(mapped_ip, saddr.port(), 0, 0));
-            }
+        if UDP_SOCKET_SUPPORT_DUAL_STACK && let SocketAddr::V4(saddr) = target_addr {
+            let mapped_ip = saddr.ip().to_ipv6_mapped();
+            target_addr = SocketAddr::V6(SocketAddrV6::new(mapped_ip, saddr.port(), 0, 0));
         }
 
         let n = socket.send_to(data, target_addr).await?;
@@ -542,7 +631,7 @@ where
                 // Reopen a new session is not perfect, because the remote target will receive packets from a different address.
                 // For most application protocol, like QUIC, it is fine to change client address.
                 //
-                // But it will happen only when a client continously send 18446744073709551616 packets without renewing the socket.
+                // But it will happen only when a client continuously send 18446744073709551616 packets without renewing the socket.
 
                 let new_session_id = generate_client_session_id();
 
@@ -563,16 +652,17 @@ where
             Some(ref mut socket) => socket,
             None => {
                 // Create a new connection to proxy server
-
                 let server = self.balancer.best_udp_server();
                 let svr_cfg = server.server_config();
 
-                let socket =
-                    ProxySocket::connect_with_opts(self.context.context(), svr_cfg, self.context.connect_opts_ref())
-                        .await?;
-                let socket = MonProxySocket::from_socket(socket, self.context.flow_stat());
+                let proxied = create_proxied_socket(
+                    self.context.as_ref(),
+                    svr_cfg,
+                    server.connect_opts_ref(),
+                )
+                .await?;
 
-                self.proxied_socket.insert(socket)
+                self.proxied_socket.insert(proxied)
             }
         };
 
@@ -612,23 +702,26 @@ where
         self.keepalive_flag = true;
 
         // Send back to client
-        if let Err(err) = self.respond_writer.send_to(self.peer_addr, addr, data).await {
-            warn!(
-                "udp failed to send back {} bytes to client {}, from target {} ({}), error: {}",
-                data.len(),
-                self.peer_addr,
-                addr,
-                if bypassed { "bypassed" } else { "proxied" },
-                err
-            );
-        } else {
-            trace!(
-                "udp relay {} <- {} ({}) with {} bytes",
-                self.peer_addr,
-                addr,
-                if bypassed { "bypassed" } else { "proxied" },
-                data.len()
-            );
+        match self.respond_writer.send_to(self.peer_addr, addr, data).await {
+            Err(err) => {
+                warn!(
+                    "udp failed to send back {} bytes to client {}, from target {} ({}), error: {}",
+                    data.len(),
+                    self.peer_addr,
+                    addr,
+                    if bypassed { "bypassed" } else { "proxied" },
+                    err
+                );
+            }
+            Ok(..) => {
+                trace!(
+                    "udp relay {} <- {} ({}) with {} bytes",
+                    self.peer_addr,
+                    addr,
+                    if bypassed { "bypassed" } else { "proxied" },
+                    data.len()
+                );
+            }
         }
     }
 }

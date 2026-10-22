@@ -15,15 +15,14 @@ use std::{
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{BufMut, BytesMut};
 use futures::{
-    future::{self, Either},
     FutureExt,
+    future::{self, Either},
 };
 use hickory_resolver::proto::{
-    op::{header::MessageType, response_code::ResponseCode, Message, OpCode, Query},
+    op::{Message, MessageType, OpCode, Query, ResponseCode},
     rr::{DNSClass, Name, RData, RecordType},
 };
 use log::{debug, error, info, trace, warn};
-use rand::{thread_rng, Rng};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
@@ -31,10 +30,10 @@ use tokio::{
 };
 
 use shadowsocks::{
+    ServerAddr,
     config::Mode,
     net::TcpListener,
-    relay::{udprelay::MAXIMUM_UDP_PAYLOAD_SIZE, Address},
-    ServerAddr,
+    relay::{Address, udprelay::MAXIMUM_UDP_PAYLOAD_SIZE},
 };
 
 use crate::{
@@ -71,9 +70,9 @@ impl DnsBuilder {
         remote_addr: Address,
         balancer: PingBalancer,
         client_cache_size: usize,
-    ) -> DnsBuilder {
+    ) -> Self {
         let context = ServiceContext::new();
-        DnsBuilder::with_context(
+        Self::with_context(
             Arc::new(context),
             bind_addr,
             local_addr,
@@ -91,8 +90,8 @@ impl DnsBuilder {
         remote_addr: Address,
         balancer: PingBalancer,
         client_cache_size: usize,
-    ) -> DnsBuilder {
-        DnsBuilder {
+    ) -> Self {
+        Self {
             context,
             mode: Mode::UdpOnly,
             local_addr,
@@ -191,8 +190,8 @@ impl DnsTcpServerBuilder {
         local_addr: Arc<NameServerAddr>,
         remote_addr: Arc<Address>,
         client: Arc<DnsClient>,
-    ) -> DnsTcpServerBuilder {
-        DnsTcpServerBuilder {
+    ) -> Self {
+        Self {
             context,
             bind_addr,
             local_addr,
@@ -212,15 +211,17 @@ impl DnsTcpServerBuilder {
     async fn build(self) -> io::Result<DnsTcpServer> {
         cfg_if::cfg_if! {
             if #[cfg(target_os = "macos")] {
-                let listener = if let Some(launchd_socket_name) = self.launchd_socket_name {
-                    use tokio::net::TcpListener as TokioTcpListener;
-                    use crate::net::launch_activate_socket::get_launch_activate_tcp_listener;
+                let listener = match self.launchd_socket_name {
+                    Some(launchd_socket_name) => {
+                        use tokio::net::TcpListener as TokioTcpListener;
+                        use crate::net::launch_activate_socket::get_launch_activate_tcp_listener;
 
-                    let std_listener = get_launch_activate_tcp_listener(&launchd_socket_name)?;
-                    let tokio_listener = TokioTcpListener::from_std(std_listener)?;
-                    TcpListener::from_listener(tokio_listener, self.context.accept_opts())?
-                } else {
-                    create_standard_tcp_listener(&self.context, &self.bind_addr).await?
+                        let std_listener = get_launch_activate_tcp_listener(&launchd_socket_name, true)?;
+                        let tokio_listener = TokioTcpListener::from_std(std_listener)?;
+                        TcpListener::from_listener(tokio_listener, self.context.accept_opts())?
+                    } _ => {
+                        create_standard_tcp_listener(&self.context, &self.bind_addr).await?
+                    }
                 };
             } else {
                 let listener = create_standard_tcp_listener(&self.context, &self.bind_addr).await?;
@@ -269,7 +270,7 @@ impl DnsTcpServer {
                 }
             };
 
-            tokio::spawn(DnsTcpServer::handle_tcp_stream(
+            tokio::spawn(Self::handle_tcp_stream(
                 self.client.clone(),
                 stream,
                 peer_addr,
@@ -320,7 +321,7 @@ impl DnsTcpServer {
                 Ok(m) => m,
                 Err(err) => {
                     error!("dns tcp {} parse message failed, error: {}", peer_addr, err);
-                    return Err(err.into());
+                    return Err(io::Error::other(err));
                 }
             };
 
@@ -328,11 +329,14 @@ impl DnsTcpServer {
                 Ok(m) => m,
                 Err(err) => {
                     error!("dns tcp {} lookup error: {}", peer_addr, err);
-                    return Err(err);
+                    return Err(io::Error::other(err));
                 }
             };
 
-            let mut buf = respond_message.to_vec()?;
+            let mut buf = match respond_message.to_vec() {
+                Ok(buf) => buf,
+                Err(err) => return Err(io::Error::other(err)),
+            };
             let length = buf.len();
             buf.resize(length + 2, 0);
             buf.copy_within(..length, 2);
@@ -364,8 +368,8 @@ impl DnsUdpServerBuilder {
         local_addr: Arc<NameServerAddr>,
         remote_addr: Arc<Address>,
         client: Arc<DnsClient>,
-    ) -> DnsUdpServerBuilder {
-        DnsUdpServerBuilder {
+    ) -> Self {
+        Self {
             context,
             bind_addr,
             local_addr,
@@ -385,15 +389,15 @@ impl DnsUdpServerBuilder {
     async fn build(self) -> io::Result<DnsUdpServer> {
         cfg_if::cfg_if! {
             if #[cfg(target_os = "macos")] {
-                let socket = if let Some(launchd_socket_name) = self.launchd_socket_name {
+                let socket = match self.launchd_socket_name { Some(launchd_socket_name) => {
                     use tokio::net::UdpSocket as TokioUdpSocket;
                     use crate::net::launch_activate_socket::get_launch_activate_udp_socket;
 
-                    let std_socket = get_launch_activate_udp_socket(&launchd_socket_name)?;
+                    let std_socket = get_launch_activate_udp_socket(&launchd_socket_name, true)?;
                     TokioUdpSocket::from_std(std_socket)?
-                } else {
+                } _ => {
                     create_standard_udp_listener(&self.context, &self.bind_addr).await?.into()
-                };
+                }};
             } else {
                 let socket = create_standard_udp_listener(&self.context, &self.bind_addr).await?.into();
             }
@@ -452,7 +456,7 @@ impl DnsUdpServer {
                 }
             };
 
-            tokio::spawn(DnsUdpServer::handle_udp_packet(
+            tokio::spawn(Self::handle_udp_packet(
                 self.client.clone(),
                 self.listener.clone(),
                 peer_addr,
@@ -479,7 +483,10 @@ impl DnsUdpServer {
             }
         };
 
-        let buf = respond_message.to_vec()?;
+        let buf = match respond_message.to_vec() {
+            Ok(buf) => buf,
+            Err(err) => return Err(io::Error::other(err)),
+        };
         listener.send_to(&buf, peer_addr).await?;
 
         Ok(())
@@ -590,13 +597,19 @@ fn should_forward_by_query(context: &ServiceContext, balancer: &PingBalancer, qu
     // https://github.com/shadowsocks/shadowsocks-android/issues/2722
     for server in balancer.servers() {
         let svr_cfg = server.server_config();
-        if let ServerAddr::DomainName(ref dn, ..) = svr_cfg.addr() {
+        if let ServerAddr::DomainName(dn, ..) = svr_cfg.addr() {
             // Convert domain name to `Name`
             // Ignore it if error occurs
-            if let Ok(name) = Name::from_str(dn) {
+            if let Ok(mut name) = Name::from_str(dn) {
                 // cmp will handle FQDN in case insensitive way
                 if let Ordering::Equal = query.name().cmp(&name) {
                     // It seems that query is for this server, just bypass it to local resolver
+                    trace!("DNS querying name {} of server {:?}", query.name(), svr_cfg);
+                    return Some(false);
+                }
+                // test it again with fqdn set
+                name.set_fqdn(true);
+                if let Ordering::Equal = query.name().cmp(&name) {
                     trace!("DNS querying name {} of server {:?}", query.name(), svr_cfg);
                     return Some(false);
                 }
@@ -604,7 +617,8 @@ fn should_forward_by_query(context: &ServiceContext, balancer: &PingBalancer, qu
         }
     }
 
-    if let Some(acl) = context.acl() {
+    let acl_snapshot = context.acl();
+    if let Some(acl) = acl_snapshot.as_deref() {
         if query.query_class() != DNSClass::IN {
             // unconditionally use default for all non-IN queries
             Some(acl.is_default_in_proxy_list())
@@ -630,12 +644,12 @@ fn should_forward_by_response(
     query: &Query,
 ) -> bool {
     if let Some(acl) = acl {
-        if let Ok(ref local_response) = local_response {
+        if let Ok(local_response) = local_response {
             let mut names = HashSet::new();
-            names.insert(query.name());
+            names.insert(query.name.clone());
             macro_rules! examine_name {
-                ($name:expr, $is_answer:expr) => {{
-                    names.insert($name);
+                ($name:expr_2021, $is_answer:expr_2021) => {{
+                    names.insert($name.to_owned());
                     if $is_answer {
                         if let Some(value) = check_name_in_proxy_list(acl, $name) {
                             value
@@ -648,14 +662,15 @@ fn should_forward_by_response(
                 }};
             }
             macro_rules! examine_record {
-                ($rec:ident, $is_answer:expr) => {
-                    if let Some(RData::CNAME(name)) = $rec.data() {
+                ($rec:ident, $is_answer:expr_2021) => {
+                    if let RData::CNAME(ref cname) = $rec.data {
+                        let name = &cname.0;
                         if $is_answer {
                             if let Some(value) = check_name_in_proxy_list(acl, name) {
                                 return value;
                             }
                         }
-                        names.insert(name);
+                        names.insert(name.to_owned());
                         continue;
                     }
                     if $is_answer && !query.query_type().is_any() && $rec.record_type() != query.query_type() {
@@ -666,14 +681,14 @@ fn should_forward_by_response(
                         );
                         return true;
                     }
-                    let forward = match $rec.data() {
-                        Some(RData::A(ip)) => acl.check_ip_in_proxy_list(&IpAddr::V4((*ip).into())),
-                        Some(RData::AAAA(ip)) => acl.check_ip_in_proxy_list(&IpAddr::V6((*ip).into())),
+                    let forward = match $rec.data {
+                        RData::A(ref ip) => acl.check_ip_in_proxy_list(&IpAddr::V4((*ip).into())),
+                        RData::AAAA(ref ip) => acl.check_ip_in_proxy_list(&IpAddr::V6((*ip).into())),
                         // MX records cause type A additional section processing for the host specified by EXCHANGE.
-                        Some(RData::MX(mx)) => examine_name!(mx.exchange(), $is_answer),
+                        RData::MX(ref mx) => examine_name!(&mx.exchange, $is_answer),
                         // NS records cause both the usual additional section processing to locate a type A record...
-                        Some(RData::NS(name)) => examine_name!(name, $is_answer),
-                        Some(RData::PTR(_)) => unreachable!(),
+                        RData::NS(ref name) => examine_name!(&name.0, $is_answer),
+                        RData::PTR(_) => unreachable!(),
                         _ => acl.is_default_in_proxy_list(),
                     };
                     if !forward {
@@ -681,19 +696,18 @@ fn should_forward_by_response(
                     }
                 };
             }
-            for rec in local_response.answers() {
-                if !names.contains(rec.name()) {
+            for rec in local_response.answers.iter() {
+                if !names.contains(&rec.name) {
                     warn!(
                         "local DNS response contains unexpected name {} for query {}",
-                        rec.name(),
-                        query
+                        rec.name, query
                     );
                     return true;
                 }
                 examine_record!(rec, true);
             }
-            for rec in local_response.additionals() {
-                if names.contains(rec.name()) {
+            for rec in local_response.additionals.iter() {
+                if names.contains(&rec.name) {
                     examine_record!(rec, false);
                 }
             }
@@ -713,8 +727,8 @@ struct DnsClient {
 }
 
 impl DnsClient {
-    fn new(context: Arc<ServiceContext>, balancer: PingBalancer, mode: Mode, client_cache_size: usize) -> DnsClient {
-        DnsClient {
+    fn new(context: Arc<ServiceContext>, balancer: PingBalancer, mode: Mode, client_cache_size: usize) -> Self {
+        Self {
             context,
             client_cache: DnsClientCache::new(client_cache_size),
             mode,
@@ -729,46 +743,44 @@ impl DnsClient {
         local_addr: &NameServerAddr,
         remote_addr: &Address,
     ) -> io::Result<Message> {
-        let mut message = Message::new();
-        message.set_id(request.id());
-        message.set_recursion_desired(true);
-        message.set_recursion_available(true);
-        message.set_message_type(MessageType::Response);
+        let mut message = Message::response(request.id, request.op_code);
+        message.metadata.recursion_desired = true;
+        message.metadata.recursion_available = true;
 
-        if !request.recursion_desired() {
+        if !request.metadata.recursion_desired {
             // RD is required by default. Otherwise it may not get valid respond from remote servers
 
-            message.set_recursion_desired(false);
-            message.set_response_code(ResponseCode::NotImp);
-        } else if request.op_code() != OpCode::Query || request.message_type() != MessageType::Query {
+            message.metadata.recursion_desired = false;
+            message.metadata.response_code = ResponseCode::NotImp;
+        } else if request.op_code != OpCode::Query || request.message_type != MessageType::Query {
             // Other ops are not supported
 
-            message.set_response_code(ResponseCode::NotImp);
-        } else if request.query_count() > 0 {
+            message.metadata.response_code = ResponseCode::NotImp;
+        } else if !request.queries.is_empty() {
             // Make queries according to ACL rules
 
-            let (r, forward) = self.acl_lookup(&request.queries()[0], local_addr, remote_addr).await;
+            let (r, forward) = self.acl_lookup(&request.queries[0], local_addr, remote_addr).await;
             if let Ok(result) = r {
-                for rec in result.answers() {
+                for rec in result.answers.iter() {
                     trace!("dns answer: {:?}", rec);
-                    match rec.data() {
-                        Some(RData::A(ip)) => {
+                    match rec.data {
+                        RData::A(ip) => {
                             self.context
-                                .add_to_reverse_lookup_cache(Ipv4Addr::from(*ip).into(), forward)
+                                .add_to_reverse_lookup_cache(Ipv4Addr::from(ip).into(), forward)
                                 .await
                         }
-                        Some(RData::AAAA(ip)) => {
+                        RData::AAAA(ip) => {
                             self.context
-                                .add_to_reverse_lookup_cache(Ipv6Addr::from(*ip).into(), forward)
+                                .add_to_reverse_lookup_cache(Ipv6Addr::from(ip).into(), forward)
                                 .await
                         }
                         _ => (),
                     }
                 }
                 message = result;
-                message.set_id(request.id());
+                message.metadata.id = request.id;
             } else {
-                message.set_response_code(ResponseCode::ServFail);
+                message.metadata.response_code = ResponseCode::ServFail;
             }
         }
         Ok(message)
@@ -799,7 +811,7 @@ impl DnsClient {
 
         let decider = async {
             let local_response = self.lookup_local(query, local_addr).await;
-            if should_forward_by_response(self.context.acl(), &local_response, query) {
+            if should_forward_by_response(self.context.acl().as_deref(), &local_response, query) {
                 None
             } else {
                 Some(local_response)
@@ -853,9 +865,8 @@ impl DnsClient {
     }
 
     async fn lookup_remote_inner(&self, query: &Query, remote_addr: &Address) -> io::Result<Message> {
-        let mut message = Message::new();
-        message.set_id(thread_rng().gen());
-        message.set_recursion_desired(true);
+        let mut message = Message::query();
+        message.metadata.recursion_desired = true;
         message.add_query(query.clone());
 
         // Query UDP and TCP
@@ -866,17 +877,17 @@ impl DnsClient {
                 self.client_cache
                     .lookup_remote(&self.context, server.server_config(), remote_addr, message, false)
                     .await
-                    .map_err(From::from)
+                    .map_err(io::Error::other)
             }
             Mode::UdpOnly => {
                 let server = self.balancer.best_udp_server();
                 self.client_cache
                     .lookup_remote(&self.context, server.server_config(), remote_addr, message, true)
                     .await
-                    .map_err(From::from)
+                    .map_err(io::Error::other)
             }
             Mode::TcpAndUdp => {
-                // Query TCP & UDP simutaneously
+                // Query TCP & UDP simultaneously
 
                 let message2 = message.clone();
                 let tcp_fut = async {
@@ -884,7 +895,7 @@ impl DnsClient {
                     // Then this future will be disabled and have no effect
                     //
                     // Randomly choose from 500ms ~ 1.5s for preventing obvious request pattern
-                    let sleep_time = thread_rng().gen_range(500..=1500);
+                    let sleep_time = rand::random_range(500..=1500);
                     time::sleep(Duration::from_millis(sleep_time)).await;
 
                     let server = self.balancer.best_tcp_server();
@@ -905,11 +916,11 @@ impl DnsClient {
                 match future::select(tcp_fut, udp_fut).await {
                     Either::Left((res, next)) => match res {
                         Ok(o) => Ok(o),
-                        Err(..) => next.await.map_err(From::from),
+                        Err(..) => next.await.map_err(io::Error::other),
                     },
                     Either::Right((res, next)) => match res {
                         Ok(o) => Ok(o),
-                        Err(..) => next.await.map_err(From::from),
+                        Err(..) => next.await.map_err(io::Error::other),
                     },
                 }
             }
@@ -932,9 +943,8 @@ impl DnsClient {
     }
 
     async fn lookup_local_inner(&self, query: &Query, local_addr: &NameServerAddr) -> io::Result<Message> {
-        let mut message = Message::new();
-        message.set_id(thread_rng().gen());
-        message.set_recursion_desired(true);
+        let mut message = Message::query();
+        message.metadata.recursion_desired = true;
         message.add_query(query.clone());
 
         match *local_addr {
@@ -945,7 +955,7 @@ impl DnsClient {
                     self.client_cache
                         .lookup_local(ns, message.clone(), self.context.connect_opts_ref(), true);
                 let tcp_query = async move {
-                    // Send TCP query after 500ms, because UDP will always return faster than TCP, there is no need to send queries simutaneously
+                    // Send TCP query after 500ms, because UDP will always return faster than TCP, there is no need to send queries simultaneously
                     time::sleep(Duration::from_millis(500)).await;
 
                     self.client_cache
@@ -958,9 +968,9 @@ impl DnsClient {
 
                 match future::select(udp_query, tcp_query).await {
                     Either::Left((Ok(m), ..)) => Ok(m),
-                    Either::Left((Err(..), next)) => next.await.map_err(From::from),
+                    Either::Left((Err(..), next)) => next.await.map_err(io::Error::other),
                     Either::Right((Ok(m), ..)) => Ok(m),
-                    Either::Right((Err(..), next)) => next.await.map_err(From::from),
+                    Either::Right((Err(..), next)) => next.await.map_err(io::Error::other),
                 }
             }
             #[cfg(unix)]
@@ -968,7 +978,7 @@ impl DnsClient {
                 .client_cache
                 .lookup_unix_stream(path, message)
                 .await
-                .map_err(From::from),
+                .map_err(io::Error::other),
         }
     }
 }

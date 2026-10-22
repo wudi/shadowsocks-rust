@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     io::{self, ErrorKind},
     mem,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream as StdTcpStream},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream as StdTcpStream},
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
     pin::Pin,
     ptr,
@@ -14,7 +14,7 @@ use std::{
 
 use log::{debug, error, warn};
 use pin_project::pin_project;
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use socket2::{Domain, Protocol, SockAddr, SockAddrStorage, Socket, Type};
 use tokio::{
     io::{AsyncRead, AsyncWrite, Interest, ReadBuf},
     net::{TcpSocket, TcpStream as TokioTcpStream, UdpSocket},
@@ -22,11 +22,9 @@ use tokio::{
 use tokio_tfo::TfoStream;
 
 use crate::net::{
+    AcceptOpts, AddrFamily, ConnectOpts,
     sys::{set_common_sockopt_after_connect, set_common_sockopt_for_connect, socket_bind_dual_stack},
     udp::{BatchRecvMessage, BatchSendMessage},
-    AcceptOpts,
-    AddrFamily,
-    ConnectOpts,
 };
 
 /// A `TcpStream` that supports TFO (TCP Fast Open)
@@ -56,6 +54,10 @@ impl TcpStream {
 
         let socket = unsafe {
             let fd = libc::socket(AF_MULTIPATH, libc::SOCK_STREAM, libc::IPPROTO_TCP);
+            if fd < 0 {
+                let err = io::Error::last_os_error();
+                return Err(err);
+            }
             let socket = Socket::from_raw_fd(fd);
             socket.set_nonblocking(true)?;
             TcpSocket::from_raw_fd(socket.into_raw_fd())
@@ -83,7 +85,7 @@ impl TcpStream {
                     let raddr = SockAddr::from(addr);
 
                     let mut endpoints: libc::sa_endpoints_t = mem::zeroed();
-                    endpoints.sae_dstaddr = raddr.as_ptr();
+                    endpoints.sae_dstaddr = raddr.as_ptr() as *const _;
                     endpoints.sae_dstaddrlen = raddr.len();
 
                     let ret = libc::connectx(
@@ -353,8 +355,19 @@ pub fn set_disable_ip_fragmentation<S: AsRawFd>(af: AddrFamily, socket: &S) -> i
 #[inline]
 pub async fn create_outbound_udp_socket(af: AddrFamily, config: &ConnectOpts) -> io::Result<UdpSocket> {
     let bind_addr = match (af, config.bind_local_addr) {
-        (AddrFamily::Ipv4, Some(IpAddr::V4(ip))) => SocketAddr::new(ip.into(), 0),
-        (AddrFamily::Ipv6, Some(IpAddr::V6(ip))) => SocketAddr::new(ip.into(), 0),
+        (AddrFamily::Ipv4, Some(SocketAddr::V4(addr))) => addr.into(),
+        (AddrFamily::Ipv4, Some(SocketAddr::V6(addr))) => {
+            // Map IPv6 bind_local_addr to IPv4 if AF is IPv4
+            match addr.ip().to_ipv4_mapped() {
+                Some(addr) => SocketAddr::new(addr.into(), 0),
+                None => return Err(io::Error::new(ErrorKind::InvalidInput, "Invalid IPv6 address")),
+            }
+        }
+        (AddrFamily::Ipv6, Some(SocketAddr::V6(addr))) => addr.into(),
+        (AddrFamily::Ipv6, Some(SocketAddr::V4(addr))) => {
+            // Map IPv4 bind_local_addr to IPv6 if AF is IPv6
+            SocketAddr::new(addr.ip().to_ipv6_mapped().into(), 0)
+        }
         (AddrFamily::Ipv4, ..) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
         (AddrFamily::Ipv6, ..) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
     };
@@ -377,7 +390,9 @@ pub async fn bind_outbound_udp_socket(bind_addr: &SocketAddr, config: &ConnectOp
         UdpSocket::from_std(socket.into())?
     };
 
-    if let Err(err) = set_disable_ip_fragmentation(af, &socket) {
+    if !config.udp.allow_fragmentation
+        && let Err(err) = set_disable_ip_fragmentation(af, &socket)
+    {
         warn!("failed to disable IP fragmentation, error: {}", err);
     }
 
@@ -403,7 +418,7 @@ struct msghdr_x {
     msg_datalen: libc::size_t,       //< byte length of buffer in msg_iov
 }
 
-extern "C" {
+unsafe extern "C" {
     fn recvmsg_x(s: libc::c_int, msgp: *const msghdr_x, cnt: libc::c_uint, flags: libc::c_int) -> libc::ssize_t;
     fn sendmsg_x(s: libc::c_int, msgp: *const msghdr_x, cnt: libc::c_uint, flags: libc::c_int) -> libc::ssize_t;
 }
@@ -413,8 +428,9 @@ static SUPPORT_BATCH_SEND_RECV_MSG: AtomicBool = AtomicBool::new(true);
 fn recvmsg_fallback<S: AsRawFd>(sock: &S, msg: &mut BatchRecvMessage<'_>) -> io::Result<()> {
     let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
 
-    let addr_storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
-    let addr_len = mem::size_of_val(&addr_storage) as libc::socklen_t;
+    let addr_storage = SockAddrStorage::zeroed();
+    let addr_len = addr_storage.size_of() as libc::socklen_t;
+
     let sock_addr = unsafe { SockAddr::new(addr_storage, addr_len) };
     hdr.msg_name = sock_addr.as_ptr() as *mut _;
     hdr.msg_namelen = sock_addr.len() as _;
@@ -449,8 +465,8 @@ pub fn batch_recvmsg<S: AsRawFd>(sock: &S, msgs: &mut [BatchRecvMessage<'_>]) ->
     for msg in msgs.iter_mut() {
         let mut hdr: msghdr_x = unsafe { mem::zeroed() };
 
-        let addr_storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
-        let addr_len = mem::size_of_val(&addr_storage) as libc::socklen_t;
+        let addr_storage = SockAddrStorage::zeroed();
+        let addr_len = addr_storage.size_of() as libc::socklen_t;
 
         vec_msg_name.push(unsafe { SockAddr::new(addr_storage, addr_len) });
         let sock_addr = vec_msg_name.last_mut().unwrap();

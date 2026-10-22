@@ -3,6 +3,7 @@
 use std::{
     io::{self, ErrorKind},
     pin::Pin,
+    sync::LazyLock,
     task::{self, Poll},
 };
 
@@ -10,7 +11,6 @@ use bytes::{BufMut, BytesMut};
 use cfg_if::cfg_if;
 use futures::ready;
 use log::trace;
-use once_cell::sync::Lazy;
 use pin_project::pin_project;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -30,12 +30,14 @@ use crate::{
     },
 };
 
+#[derive(Debug)]
 enum ProxyClientStreamWriteState {
     Connect(Address),
     Connecting(BytesMut),
     Connected,
 }
 
+#[derive(Debug)]
 enum ProxyClientStreamReadState {
     #[cfg(feature = "aead-cipher-2022")]
     CheckRequestNonce,
@@ -43,6 +45,7 @@ enum ProxyClientStreamReadState {
 }
 
 /// A stream for sending / receiving data stream from remote server via shadowsocks' proxy server
+#[derive(Debug)]
 #[pin_project]
 pub struct ProxyClientStream<S> {
     #[pin]
@@ -52,19 +55,15 @@ pub struct ProxyClientStream<S> {
     context: SharedContext,
 }
 
-static DEFAULT_CONNECT_OPTS: Lazy<ConnectOpts> = Lazy::new(Default::default);
+static DEFAULT_CONNECT_OPTS: LazyLock<ConnectOpts> = LazyLock::new(Default::default);
 
 impl ProxyClientStream<OutboundTcpStream> {
     /// Connect to target `addr` via shadowsocks' server configured by `svr_cfg`
-    pub async fn connect<A>(
-        context: SharedContext,
-        svr_cfg: &ServerConfig,
-        addr: A,
-    ) -> io::Result<ProxyClientStream<OutboundTcpStream>>
+    pub async fn connect<A>(context: SharedContext, svr_cfg: &ServerConfig, addr: A) -> io::Result<Self>
     where
         A: Into<Address>,
     {
-        ProxyClientStream::connect_with_opts(context, svr_cfg, addr, &DEFAULT_CONNECT_OPTS).await
+        Self::connect_with_opts(context, svr_cfg, addr, &DEFAULT_CONNECT_OPTS).await
     }
 
     /// Connect to target `addr` via shadowsocks' server configured by `svr_cfg`
@@ -73,11 +72,11 @@ impl ProxyClientStream<OutboundTcpStream> {
         svr_cfg: &ServerConfig,
         addr: A,
         opts: &ConnectOpts,
-    ) -> io::Result<ProxyClientStream<OutboundTcpStream>>
+    ) -> io::Result<Self>
     where
         A: Into<Address>,
     {
-        ProxyClientStream::connect_with_opts_map(context, svr_cfg, addr, opts, |s| s).await
+        Self::connect_with_opts_map(context, svr_cfg, addr, opts, |s| s).await
     }
 }
 
@@ -91,12 +90,12 @@ where
         svr_cfg: &ServerConfig,
         addr: A,
         map_fn: F,
-    ) -> io::Result<ProxyClientStream<S>>
+    ) -> io::Result<Self>
     where
         A: Into<Address>,
         F: FnOnce(OutboundTcpStream) -> S,
     {
-        ProxyClientStream::connect_with_opts_map(context, svr_cfg, addr, &DEFAULT_CONNECT_OPTS, map_fn).await
+        Self::connect_with_opts_map(context, svr_cfg, addr, &DEFAULT_CONNECT_OPTS, map_fn).await
     }
 
     /// Connect to target `addr` via shadowsocks' server configured by `svr_cfg`, maps `TcpStream` to customized stream with `map_fn`
@@ -106,7 +105,7 @@ where
         addr: A,
         opts: &ConnectOpts,
         map_fn: F,
-    ) -> io::Result<ProxyClientStream<S>>
+    ) -> io::Result<Self>
     where
         A: Into<Address>,
         F: FnOnce(OutboundTcpStream) -> S,
@@ -125,7 +124,7 @@ where
                         return Err(io::Error::new(
                             ErrorKind::TimedOut,
                             format!("connect {} timeout", svr_cfg.addr()),
-                        ))
+                        ));
                     }
                 }
             }
@@ -139,13 +138,13 @@ where
             opts
         );
 
-        Ok(ProxyClientStream::from_stream(context, map_fn(stream), svr_cfg, addr))
+        Ok(Self::from_stream(context, map_fn(stream), svr_cfg, addr))
     }
 
     /// Create a `ProxyClientStream` with a connected `stream` to a shadowsocks' server
     ///
     /// NOTE: `stream` must be connected to the server with the same configuration as `svr_cfg`, otherwise strange errors would occurs
-    pub fn from_stream<A>(context: SharedContext, stream: S, svr_cfg: &ServerConfig, addr: A) -> ProxyClientStream<S>
+    pub fn from_stream<A>(context: SharedContext, stream: S, svr_cfg: &ServerConfig, addr: A) -> Self
     where
         A: Into<Address>,
     {
@@ -171,7 +170,7 @@ where
             ProxyClientStreamReadState::Established
         };
 
-        ProxyClientStream {
+        Self {
             stream,
             writer_state: ProxyClientStreamWriteState::Connect(addr),
             reader_state,
@@ -231,11 +230,7 @@ where
                         let sent_nonce = this.stream.sent_nonce();
                         let sent_nonce = if sent_nonce.is_empty() { None } else { Some(sent_nonce) };
                         if sent_nonce != this.stream.received_request_nonce() {
-                            return Err(io::Error::new(
-                                ErrorKind::Other,
-                                "received TCP response header with unmatched salt",
-                            ))
-                            .into();
+                            return Err(io::Error::other("received TCP response header with unmatched salt")).into();
                         }
 
                         *(this.reader_state) = ProxyClientStreamReadState::Established;
@@ -300,7 +295,7 @@ where
 
         loop {
             match this.writer_state {
-                ProxyClientStreamWriteState::Connect(ref addr) => {
+                &mut ProxyClientStreamWriteState::Connect(ref addr) => {
                     let buffer = make_first_packet_buffer(this.stream.method(), addr, buf);
 
                     // Save the concatenated buffer before it is written successfully.
@@ -310,7 +305,7 @@ where
                     // before IO completion.
                     *(this.writer_state) = ProxyClientStreamWriteState::Connecting(buffer);
                 }
-                ProxyClientStreamWriteState::Connecting(ref buffer) => {
+                &mut ProxyClientStreamWriteState::Connecting(ref buffer) => {
                     let n = ready!(this.stream.poll_write_encrypted(cx, buffer))?;
 
                     // In general, poll_write_encrypted should perform like write_all.

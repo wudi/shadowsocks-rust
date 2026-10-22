@@ -9,12 +9,16 @@ use std::{
     io,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use futures::ready;
 use log::{debug, trace};
 use pin_project::pin_project;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    time::{self, Instant, Sleep},
+};
 
 use crate::crypto::{CipherCategory, CipherKind};
 
@@ -134,7 +138,7 @@ where
     Copy {
         reader,
         writer,
-        buf: CopyBuffer::new(encrypted_read_buffer_size(method)),
+        buf: CopyBuffer::new(plain_read_buffer_size(method)),
     }
     .await
 }
@@ -153,19 +157,9 @@ where
     .await
 }
 
-fn encrypted_read_buffer_size(method: CipherKind) -> usize {
-    match method.category() {
-        CipherCategory::Aead => super::aead::MAX_PACKET_SIZE + method.tag_len(),
-        #[cfg(feature = "stream-cipher")]
-        CipherCategory::Stream => 1 << 14,
-        CipherCategory::None => 1 << 14,
-        #[cfg(feature = "aead-cipher-2022")]
-        CipherCategory::Aead2022 => super::aead_2022::MAX_PACKET_SIZE + method.tag_len(),
-    }
-}
-
 fn plain_read_buffer_size(method: CipherKind) -> usize {
     match method.category() {
+        #[cfg(feature = "aead-cipher")]
         CipherCategory::Aead => super::aead::MAX_PACKET_SIZE,
         #[cfg(feature = "stream-cipher")]
         CipherCategory::Stream => 1 << 14,
@@ -175,23 +169,32 @@ fn plain_read_buffer_size(method: CipherKind) -> usize {
     }
 }
 
-/// Create a buffer for reading from shadowsocks' encrypted channel
-#[inline]
-pub fn alloc_encrypted_read_buffer(method: CipherKind) -> Box<[u8]> {
-    vec![0u8; encrypted_read_buffer_size(method)].into_boxed_slice()
-}
-
 /// Create a buffer for reading from plain channel (not encrypted), for copying data into encrypted channel
 #[inline]
 pub fn alloc_plain_read_buffer(method: CipherKind) -> Box<[u8]> {
     vec![0u8; plain_read_buffer_size(method)].into_boxed_slice()
 }
 
+/// Maximum idle time of the remaining direction after the other direction has been shut down
+///
+/// Some peers (for example, SIP003 plugins) never close their side of a half-closed connection.
+/// Without this limit, the socket would stay in `FIN_WAIT_2` forever and hold a local port.
+pub const HALF_CLOSE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug)]
 enum TransferState {
     Running(CopyBuffer),
     ShuttingDown(u64),
     Done(u64),
+}
+
+impl TransferState {
+    fn transferred(&self) -> u64 {
+        match *self {
+            Self::Running(ref buf) => buf.amt,
+            Self::ShuttingDown(count) | Self::Done(count) => count,
+        }
+    }
 }
 
 #[pin_project(project = CopyBidirectionalProj)]
@@ -202,6 +205,23 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     b: &'a mut B,
     a_to_b: TransferState,
     b_to_a: TransferState,
+    half_close_timeout: Duration,
+    half_close_timer: Option<Pin<Box<Sleep>>>,
+    half_close_transferred: u64,
+}
+
+impl<'a, A: ?Sized, B: ?Sized> CopyBidirectional<'a, A, B> {
+    fn new(a: &'a mut A, b: &'a mut B, buffer_size: usize, half_close_timeout: Duration) -> Self {
+        Self {
+            a,
+            b,
+            a_to_b: TransferState::Running(CopyBuffer::new(buffer_size)),
+            b_to_a: TransferState::Running(CopyBuffer::new(buffer_size)),
+            half_close_timeout,
+            half_close_timer: None,
+            half_close_transferred: 0,
+        }
+    }
 }
 
 fn transfer_one_direction<A, B>(
@@ -242,21 +262,49 @@ where
             mut b,
             a_to_b,
             b_to_a,
+            half_close_timeout,
+            half_close_timer,
+            half_close_transferred,
         } = self.project();
 
         let poll_a_to_b = transfer_one_direction(cx, a_to_b, a.as_mut(), b.as_mut())?;
         let poll_b_to_a = transfer_one_direction(cx, b_to_a, b.as_mut(), a.as_mut())?;
 
-        // It is not a problem if ready! returns early because transfer_one_direction for the
-        // other direction will keep returning TransferState::Done(count) in future calls to poll
-        let a_to_b = ready!(poll_a_to_b);
-        let b_to_a = ready!(poll_b_to_a);
+        // transfer_one_direction for the finished direction will keep returning
+        // TransferState::Done(count) in future calls to poll
+        match (poll_a_to_b, poll_b_to_a) {
+            (Poll::Ready(a_to_b), Poll::Ready(b_to_a)) => return Poll::Ready(Ok((a_to_b, b_to_a))),
+            (Poll::Pending, Poll::Pending) => return Poll::Pending,
+            _ => {}
+        }
 
-        Poll::Ready(Ok((a_to_b, b_to_a)))
+        // One direction has been shut down, the other one is still running.
+        // Restart the idle timer whenever the remaining direction makes progress.
+        let transferred = a_to_b.transferred() + b_to_a.transferred();
+        let timer = match half_close_timer {
+            Some(timer) => {
+                if transferred != *half_close_transferred {
+                    timer.as_mut().reset(Instant::now() + *half_close_timeout);
+                    *half_close_transferred = transferred;
+                }
+                timer
+            }
+            None => {
+                *half_close_transferred = transferred;
+                half_close_timer.insert(Box::pin(time::sleep(*half_close_timeout)))
+            }
+        };
+
+        ready!(timer.as_mut().poll(cx));
+
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "half-closed connection idle timeout",
+        )))
     }
 }
 
-impl<'a, A, B> Future for CopyBidirectional<'a, A, B>
+impl<A, B> Future for CopyBidirectional<'_, A, B>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -271,8 +319,7 @@ where
                     Ok(..) => {
                         trace!(
                             "copy bidirection ends, a_to_b: {:?}, b_to_a: {:?}",
-                            self.a_to_b,
-                            self.b_to_a
+                            self.a_to_b, self.b_to_a
                         );
                     }
                     Err(ref err) => {
@@ -299,6 +346,8 @@ where
 /// the other direction will continue.
 ///
 /// The future will complete successfully once both directions of communication has been shut down.
+/// After one direction has been shut down, the future fails with [`io::ErrorKind::TimedOut`] if the
+/// other direction stays idle for [`HALF_CLOSE_IDLE_TIMEOUT`].
 /// A direction is shut down when the reader reports EOF,
 /// at which point [`shutdown()`] is called on the corresponding writer. When finished,
 /// it will return a tuple of the number of bytes copied from encrypted to plain
@@ -324,12 +373,12 @@ where
     E: AsyncRead + AsyncWrite + Unpin + ?Sized,
     P: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    CopyBidirectional {
-        a: encrypted,
-        b: plain,
-        a_to_b: TransferState::Running(CopyBuffer::new(encrypted_read_buffer_size(method))),
-        b_to_a: TransferState::Running(CopyBuffer::new(plain_read_buffer_size(method))),
-    }
+    CopyBidirectional::new(
+        encrypted,
+        plain,
+        plain_read_buffer_size(method),
+        HALF_CLOSE_IDLE_TIMEOUT,
+    )
     .await
 }
 
@@ -344,6 +393,8 @@ where
 /// the other direction will continue.
 ///
 /// The future will complete successfully once both directions of communication has been shut down.
+/// After one direction has been shut down, the future fails with [`io::ErrorKind::TimedOut`] if the
+/// other direction stays idle for [`HALF_CLOSE_IDLE_TIMEOUT`].
 /// A direction is shut down when the reader reports EOF,
 /// at which point [`shutdown()`] is called on the corresponding writer. When finished,
 /// it will return a tuple of the number of bytes copied from encrypted to plain
@@ -365,11 +416,60 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    CopyBidirectional {
-        a,
-        b,
-        a_to_b: TransferState::Running(CopyBuffer::new(8192)),
-        b_to_a: TransferState::Running(CopyBuffer::new(8192)),
+    CopyBidirectional::new(a, b, 8192, HALF_CLOSE_IDLE_TIMEOUT).await
+}
+
+#[cfg(test)]
+mod test {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    use super::*;
+
+    const TEST_TIMEOUT: Duration = Duration::from_millis(200);
+
+    #[tokio::test]
+    async fn half_closed_idle_times_out() {
+        let (mut a, mut a_peer) = duplex(1024);
+        let (mut b, _b_peer) = duplex(1024);
+
+        // a's peer half-closes, b's peer never closes and never sends anything
+        a_peer.shutdown().await.unwrap();
+
+        let start = std::time::Instant::now();
+        let err = CopyBidirectional::new(&mut a, &mut b, 1024, TEST_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= TEST_TIMEOUT);
     }
-    .await
+
+    #[tokio::test]
+    async fn half_closed_active_keeps_running() {
+        let (mut a, mut a_peer) = duplex(1024);
+        let (mut b, mut b_peer) = duplex(1024);
+
+        a_peer.shutdown().await.unwrap();
+
+        let writer = async move {
+            // Keep sending for longer than the idle timeout, then close
+            for _ in 0..6 {
+                time::sleep(TEST_TIMEOUT / 2).await;
+                b_peer.write_all(b"x").await.unwrap();
+            }
+            b_peer.shutdown().await.unwrap();
+        };
+        let reader = async move {
+            let mut buf = Vec::new();
+            a_peer.read_to_end(&mut buf).await.unwrap();
+            buf.len()
+        };
+
+        let (res, _, received) = tokio::join!(
+            CopyBidirectional::new(&mut a, &mut b, 1024, TEST_TIMEOUT),
+            writer,
+            reader
+        );
+        assert_eq!(res.unwrap(), (0, 6));
+        assert_eq!(received, 6);
+    }
 }

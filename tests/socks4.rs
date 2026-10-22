@@ -5,6 +5,7 @@ use std::{
     str,
 };
 
+use byte_string::ByteStr;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     time::{self, Duration},
@@ -13,8 +14,7 @@ use tokio::{
 use shadowsocks_service::{
     config::{Config, ConfigType, LocalConfig, LocalInstanceConfig, ProtocolType, ServerInstanceConfig},
     local::socks::client::Socks4TcpClient,
-    run_local,
-    run_server,
+    run_local, run_server,
     shadowsocks::{
         config::{ServerAddr, ServerConfig},
         crypto::CipherKind,
@@ -28,7 +28,7 @@ pub struct Socks4TestServer {
 }
 
 impl Socks4TestServer {
-    pub fn new<S, L>(svr_addr: S, local_addr: L, pwd: &str, method: CipherKind) -> Socks4TestServer
+    pub fn new<S, L>(svr_addr: S, local_addr: L, pwd: &str, method: CipherKind) -> Self
     where
         S: ToSocketAddrs,
         L: ToSocketAddrs,
@@ -36,15 +36,13 @@ impl Socks4TestServer {
         let svr_addr = svr_addr.to_socket_addrs().unwrap().next().unwrap();
         let local_addr = local_addr.to_socket_addrs().unwrap().next().unwrap();
 
-        Socks4TestServer {
+        Self {
             local_addr,
             svr_config: {
                 let mut cfg = Config::new(ConfigType::Server);
-                cfg.server = vec![ServerInstanceConfig::with_server_config(ServerConfig::new(
-                    svr_addr,
-                    pwd.to_owned(),
-                    method,
-                ))];
+                cfg.server = vec![ServerInstanceConfig::with_server_config(
+                    ServerConfig::new(svr_addr, pwd.to_owned(), method).unwrap(),
+                )];
                 cfg
             },
             cli_config: {
@@ -53,11 +51,9 @@ impl Socks4TestServer {
                     ServerAddr::from(local_addr),
                     ProtocolType::Socks,
                 ))];
-                cfg.server = vec![ServerInstanceConfig::with_server_config(ServerConfig::new(
-                    svr_addr,
-                    pwd.to_owned(),
-                    method,
-                ))];
+                cfg.server = vec![ServerInstanceConfig::with_server_config(
+                    ServerConfig::new(svr_addr, pwd.to_owned(), method).unwrap(),
+                )];
                 cfg
             },
         }
@@ -91,7 +87,8 @@ async fn socks4_relay_connect() {
     let svr = Socks4TestServer::new(SERVER_ADDR, LOCAL_ADDR, PASSWORD, METHOD);
     svr.run().await;
 
-    static HTTP_REQUEST: &[u8] = b"GET /success.txt HTTP/1.0\r\nHost: detectportal.firefox.com\r\nAccept: */*\r\n\r\n";
+    const HTTP_REQUEST: &[u8] =
+        b"GET /success.txt HTTP/1.1\r\nHost: detectportal.firefox.com\r\nAccept: */*\r\nConnection: close\r\n\r\n";
 
     let mut c = Socks4TcpClient::connect(("detectportal.firefox.com", 80), LOCAL_ADDR, Vec::new())
         .await
@@ -105,6 +102,10 @@ async fn socks4_relay_connect() {
     let mut buf = Vec::new();
     r.read_until(b'\n', &mut buf).await.unwrap();
 
-    let http_status = b"HTTP/1.0 200 OK\r\n";
-    assert!(buf.starts_with(http_status));
+    let http_status = b"HTTP/1.1 200 OK\r\n";
+    assert!(
+        buf.starts_with(http_status),
+        "HTTP status line mismatched, got: {:?}",
+        ByteStr::new(&buf)
+    );
 }
